@@ -18,12 +18,14 @@
                        不會覆蓋你既有的 v3.6 紀錄。
 
 ⚠ 使用前必讀：
-    1. 本程式假設下列檔案與本程式在「同一個資料夾」：
+    1. 本程式會自動尋找下列四支程式，放在「與本程式同一個資料夾」或
+       「同資料夾下的 tools/ 子目錄」都可以：
            tw_active_stocks_predictor_v2.1.py
            claude_stock_analyzer_v3.7.py
-           tools/paper_trading.py
-           tools/log_review.py
-       若檔名或路徑不同，請修改下方參數設定區。
+           paper_trading.py
+           log_review.py
+       若檔名不同（例如你之後升到 v3.8），請修改下方參數設定區。
+       執行前會先檢查這四支程式是否都找得到，缺哪一支會明確告訴你。
     2. 請在「收盤後」執行（15:00 之後）。盤中執行時 analyzer v3.7 會剔除
        未完成K棒、以前一交易日為基準，模擬器則會拿不到當日完整價格。
     3. TOP_N_ACTIVE 建議 5~10 檔，數字太大會拉長執行時間，也提高被 TWSE
@@ -48,11 +50,30 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-PREDICTOR_SCRIPT = SCRIPT_DIR / "tw_active_stocks_predictor_v2.1.py"
-ANALYZER_SCRIPT = SCRIPT_DIR / "claude_stock_analyzer_v3.7.py"
-PAPER_TRADING = SCRIPT_DIR / "tools" / "paper_trading.py"
-LOG_REVIEW = SCRIPT_DIR / "tools" / "log_review.py"
+def _find(filename: str) -> Path:
+    """
+    在幾個常見位置尋找檔案，讓「全部放同一個資料夾」和「工具放 tools/ 子目錄」
+    兩種擺法都能直接執行，不用改路徑。找不到時回傳同目錄的路徑，
+    由呼叫端印出明確的錯誤訊息。
+    """
+    for candidate in (SCRIPT_DIR / filename,
+                      SCRIPT_DIR / "tools" / filename,
+                      SCRIPT_DIR.parent / filename,
+                      SCRIPT_DIR.parent / "tools" / filename):
+        if candidate.exists():
+            return candidate
+    return SCRIPT_DIR / filename
 
+
+PREDICTOR_SCRIPT = _find("tw_active_stocks_predictor_v2.1.py")
+ANALYZER_SCRIPT = _find("claude_stock_analyzer_v3.7.py")
+PAPER_TRADING = _find("paper_trading.py")
+LOG_REVIEW = _find("log_review.py")
+
+# analyzer v3.7 的紀錄檔：若目錄下已有 v3.6 建立的 stock_analysis_log.xlsx，
+# v3.7 會因欄位不一致而自動另存 stock_analysis_log_v3.7.xlsx；
+# 若是全新環境則會直接用 stock_analysis_log.xlsx。兩種都要能對上，
+# 所以下面 main() 會實際去確認檔名，這裡只是預設值。
 ANALYZER_LOG = SCRIPT_DIR / "stock_analysis_log_v3.7.xlsx"
 SIM_STATE = SCRIPT_DIR / "paper_trading_state.json"
 
@@ -100,6 +121,31 @@ def main():
     print("台股活躍股篩選 + 完整分析 + 紙上交易模擬  整合流程 v1.1")
     print(f"執行日期：{today}" + ("（模擬結算日）" if is_last_day else ""))
     print("=" * 64)
+
+    # 先確認四支程式都找得到，缺什麼一次講清楚，不要跑到一半才失敗
+    required = {
+        "活躍股篩選程式": PREDICTOR_SCRIPT,
+        "個股分析程式": ANALYZER_SCRIPT,
+        "紙上交易模擬器": PAPER_TRADING,
+        "結果回填工具": LOG_REVIEW,
+    }
+    missing = {label: p for label, p in required.items() if not p.exists()}
+    if missing:
+        print("\n✗ 缺少以下程式，無法執行：")
+        for label, p in missing.items():
+            print(f"    {label}：找不到 {p.name}")
+        print(f"\n  請把它們放在下列任一位置：")
+        print(f"    {SCRIPT_DIR}")
+        print(f"    {SCRIPT_DIR / 'tools'}")
+        sys.exit(1)
+
+    print("\n[檢查] 四支程式都已找到：")
+    for label, p in required.items():
+        try:
+            shown = p.relative_to(SCRIPT_DIR)
+        except ValueError:
+            shown = p
+        print(f"    {label}：{shown}")
 
     now = datetime.datetime.now()
     if datetime.time(9, 0) <= now.time() < datetime.time(14, 0):
