@@ -12,7 +12,8 @@
 
 版本紀錄：
     v1.0 (2026-08-25) 初版，串接 predictor v2.1 + analyzer v3.6
-    v1.1 (2026-08-28) analyzer 升級至 v3.7；新增紙上交易模擬與結果回填。
+    v1.1 (2026-08-28) analyzer 升級至 v3.7；活躍股篩選改用 v3.1（找不到時
+                       自動退回 v3.0 / v2.1）；新增紙上交易模擬與結果回填。
                        analyzer v3.7 的 Excel 欄位結構與 v3.6 不同，會自動
                        另存新檔（預設 stock_analysis_log_v3.7.xlsx），
                        不會覆蓋你既有的 v3.6 紀錄。
@@ -20,7 +21,7 @@
 ⚠ 使用前必讀：
     1. 本程式會自動尋找下列四支程式，放在「與本程式同一個資料夾」或
        「同資料夾下的 tools/ 子目錄」都可以：
-           tw_active_stocks_predictor_v2.1.py
+           tw_active_stocks_predictor_v3.1.py（找不到時退回 v3.0 / v2.1）
            claude_stock_analyzer_v3.7.py
            paper_trading.py
            log_review.py
@@ -65,7 +66,26 @@ def _find(filename: str) -> Path:
     return SCRIPT_DIR / filename
 
 
-PREDICTOR_SCRIPT = _find("tw_active_stocks_predictor_v2.1.py")
+# 活躍股篩選程式：優先用最新版。v3.1 修正了 v2.1/v3.0 共同的「永遠不抓
+# 今天」問題（收盤後執行時，篩選端會落後分析端整整一個交易日），
+# 並排除 ETF/ETN/權證/特別股——實測那正是造成分析異常的那幾檔。
+# 找不到新版時往下退，不會因為你還沒換版就跑不動。
+PREDICTOR_CANDIDATES = [
+    "tw_active_stocks_predictor_v3.1.py",
+    "tw_active_stocks_predictor_v3.0.py",
+    "tw_active_stocks_predictor_v2.1.py",
+]
+
+
+def _find_predictor() -> Path:
+    for name in PREDICTOR_CANDIDATES:
+        p = _find(name)
+        if p.exists():
+            return p
+    return SCRIPT_DIR / PREDICTOR_CANDIDATES[0]
+
+
+PREDICTOR_SCRIPT = _find_predictor()
 ANALYZER_SCRIPT = _find("claude_stock_analyzer_v3.7.py")
 PAPER_TRADING = _find("paper_trading.py")
 LOG_REVIEW = _find("log_review.py")
@@ -154,6 +174,10 @@ def main():
         print("   建議 15:00 之後再執行，才能得到當日完整的分析與模擬。\n")
 
     print(f"\n[載入] 活躍股篩選程式：{PREDICTOR_SCRIPT.name}")
+    if "v3.1" not in PREDICTOR_SCRIPT.name:
+        print(f"   ⚠ 目前使用的不是 v3.1。v2.1/v3.0 有一個共同問題：抓取起點")
+        print(f"     寫死為「昨天」，收盤後執行時篩選端會比分析端落後一個交易日。")
+        print(f"     建議把 tw_active_stocks_predictor_v3.1.py 放進本資料夾。")
     predictor = _load_module(PREDICTOR_SCRIPT, "tw_active_stocks_predictor")
     print(f"[載入] 個股分析程式：{ANALYZER_SCRIPT.name}")
     analyzer = _load_module(ANALYZER_SCRIPT, "claude_stock_analyzer")

@@ -7,6 +7,7 @@
 | 路徑 | 說明 |
 |---|---|
 | `claude_stock_analyzer_v3.7.py` | **修正版程式**。診斷出的問題都已套用，可直接取代 v3.6 使用 |
+| `tw_active_stocks_predictor_v3.1.py` | 活躍股篩選修正版：補上 v2.1/v3.0 共同的「永遠不抓今天」、ETF 4 碼漏洞（0050/0056）、關鍵字誤殺 |
 | `tw_stock_pipeline_v1.1.py` | 整合流程：活躍股篩選 → 完整分析 → 紙上交易模擬 → 結果回填，每天一支指令跑完 |
 | `tools/paper_trading.py` | **100 萬紙上交易模擬器**。6 個獨立策略帳戶平行比較，含「什麼都不做」對照組 |
 | `tools/compare_predictors.py` | **活躍股預測 v2.1 vs v3.0 實證比較**。walk-forward 測兩版選股的後續報酬與活躍度延續 |
