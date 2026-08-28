@@ -580,7 +580,17 @@ class Simulator:
 
     # ---------- 報告 ----------
     def summary(self) -> pd.DataFrame:
+        """
+        尚未結算時，「期末權益」是把持股用最近一次收盤價估算的市值
+        （mark-to-market），**還沒扣掉賣出時要付的手續費與證交稅**。
+        所以這裡另外算一欄「若現在出清淨值」：把持股市值乘上賣出成本率
+        後扣掉，那才是真的落袋數字。兩者可以差到 0.4% 以上——在一週
+        報酬率本來就只有正負 1% 的尺度下，這個差距足以讓賺變成賠。
+        結算後兩欄會相同（持股已全部變現）。
+        """
         cap = self.state["initial_capital"]
+        fee_d = self.cfg["fee_discount"]
+        sell_rate = FEE_RATE * fee_d + TAX_SELL
         rows = []
         for name, p in self.portfolios.items():
             eq = p.equity_curve[-1]["equity"] if p.equity_curve else cap
@@ -595,12 +605,20 @@ class Simulator:
             for v in curve:
                 peak = max(peak, v)
                 mdd = min(mdd, v / peak - 1)
+            # 尚未出清的持股市值 = 權益 - 現金
+            holding_value = max(eq - p.cash, 0.0)
+            liquidation_cost = holding_value * sell_rate if holding_value > 0 else 0.0
+            net_eq = eq - liquidation_cost
+
             rows.append({
                 "策略": name,
                 "說明": STRATEGY_DESC[name],
                 "期末權益": eq,
-                "損益": eq - cap,
-                "報酬率(%)": (eq / cap - 1) * 100,
+                "若現在出清淨值": net_eq,
+                "出清成本估算": liquidation_cost,
+                "損益": net_eq - cap,
+                "報酬率(%)": (net_eq / cap - 1) * 100,
+                "帳面報酬率(%)": (eq / cap - 1) * 100,
                 "買進次數": n_buy,
                 "賣出次數": n_sell,
                 "勝率(%)": (len(wins) / n_sell * 100) if n_sell else np.nan,
@@ -633,30 +651,50 @@ class Simulator:
 
 def print_report(sim: Simulator) -> None:
     cap = sim.state["initial_capital"]
+    settled = bool(sim.state.get("settled"))
     line = "=" * 72
-    print(f"\n{line}\n  紙上交易模擬結算報告\n{line}")
+    title = "紙上交易模擬 — 結算報告" if settled else "紙上交易模擬 — 期中報告（尚未結算）"
+    print(f"\n{line}\n  {title}\n{line}")
     print(f"  初始資金：每個策略各 {cap:,.0f} 元（各自獨立，非平分）")
     curves = sim.all_curves()
-    if not curves.empty:
+    n_days = curves["date"].nunique() if not curves.empty else 0
+    if n_days:
         print(f"  模擬期間：{curves['date'].min()} ～ {curves['date'].max()}"
-              f"（{curves['date'].nunique()} 個交易日）")
-    print(f"  已結算：{'是' if sim.state.get('settled') else '否（部位尚未出清，權益為市值估算）'}")
+              f"（已完成 {n_days} 個交易日）")
+    else:
+        print("  尚未執行任何交易日（剛 init 完，還沒跑過 step）")
+    print(f"  已結算：{'是（持股已全部變現）' if settled else '否（持股尚未出清）'}")
 
     s = sim.summary()
     print(f"\n【各策略績效】")
-    show = ["策略", "期末權益", "損益", "報酬率(%)", "買進次數", "賣出次數",
-            "勝率(%)", "累計交易成本", "最大回落(%)"]
+    if settled:
+        show = ["策略", "期末權益", "損益", "報酬率(%)", "買進次數", "賣出次數",
+                "勝率(%)", "累計交易成本", "最大回落(%)"]
+    else:
+        show = ["策略", "期末權益", "若現在出清淨值", "報酬率(%)", "帳面報酬率(%)",
+                "買進次數", "累計交易成本", "期末持股數"]
     print(s[show].to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
+
+    if not settled and (s["出清成本估算"] > 0).any():
+        print("\n  ※「期末權益」是持股按最近收盤價估算的市值，還沒扣掉賣出時要付的")
+        print("     手續費與證交稅。「若現在出清淨值」才是真的落袋數字，")
+        print("     「報酬率(%)」也是以它計算。兩者可以差 0.4% 以上——在一週報酬率")
+        print("     本來就只有正負 1% 的尺度下，這個差距足以讓帳面的賺變成實際的賠。")
 
     cash_row = s[s["策略"] == "cash"]
     if not cash_row.empty:
         base = float(cash_row["報酬率(%)"].iloc[0])
         print(f"\n【對照：什麼都不做 = {base:+.2f}%】")
-        beat = s[(s["策略"] != "cash") & (s["報酬率(%)"] > base)]
-        lose = s[(s["策略"] != "cash") & (s["報酬率(%)"] <= base)]
-        print(f"  贏過「什麼都不做」的策略：{len(beat)} 個"
+        others = s[s["策略"] != "cash"]
+        beat = others[others["報酬率(%)"] > base + 1e-9]
+        tie = others[(others["報酬率(%)"] - base).abs() <= 1e-9]
+        lose = others[others["報酬率(%)"] < base - 1e-9]
+        print(f"  贏過：{len(beat)} 個"
               + (f"（{'、'.join(beat['策略'])}）" if len(beat) else ""))
-        print(f"  輸給「什麼都不做」的策略：{len(lose)} 個"
+        if len(tie):
+            print(f"  打平：{len(tie)} 個（{'、'.join(tie['策略'])}）"
+                  + "　← 完全沒有交易，所以跟全現金一樣")
+        print(f"  輸給：{len(lose)} 個"
               + (f"（{'、'.join(lose['策略'])}）" if len(lose) else ""))
 
     trades = sim.all_trades()
@@ -670,9 +708,11 @@ def print_report(sim: Simulator) -> None:
         print("  如果這是 strategy_decision 造成的，那正是這次模擬要看到的結果：")
         print("  現行規則在這段期間完全不出手。")
 
-    n_days = curves["date"].nunique() if not curves.empty else 0
     print(f"\n{line}")
     print("【判讀提醒 — 請務必看完再下結論】")
+    if n_days == 0:
+        print("  0. 目前還沒有執行任何交易日，以上數字全部是初始值。")
+        print("     請先執行 tw_stock_pipeline_v1.1.py 或 paper_trading.py step。")
     print(f"  1. 本次模擬只有 {n_days} 個交易日。同一天不同股票會一起漲跌，")
     print(f"     有效獨立樣本數大約是 1，不是 {n_days}，更不是交易筆數。")
     print("  2. 這個結果無法區分「策略有效」與「這週運氣好」。名次高低幾乎")
