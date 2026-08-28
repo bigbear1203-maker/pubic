@@ -14,6 +14,9 @@
     v1.0 (2026-08-25) 初版，串接 predictor v2.1 + analyzer v3.6
     v1.1 (2026-08-28) analyzer 升級至 v3.7；活躍股篩選改用 v3.1（找不到時
                        自動退回 v3.0 / v2.1）；新增紙上交易模擬與結果回填。
+                       模擬改為長期執行，沒有結束日期：每執行一次推進一天，
+                       每週五自動另存週報快照（不出清部位），要收尾時才
+                       用 --settle 結算出清。
                        analyzer v3.7 的 Excel 欄位結構與 v3.6 不同，會自動
                        另存新檔（預設 stock_analysis_log_v3.7.xlsx），
                        不會覆蓋你既有的 v3.6 紀錄。
@@ -39,6 +42,7 @@
     6. 本流程為紙上推演，不下真單，不構成投資建議。
 """
 
+import argparse
 import datetime
 import importlib.util
 import subprocess
@@ -100,8 +104,10 @@ SIM_STATE = SCRIPT_DIR / "paper_trading_state.json"
 TOP_N_ACTIVE = 10          # 進入完整分析的活躍股檔數
 ANALYZER_PAUSE_SEC = 1.5   # 分析多檔股票時每檔之間的延遲秒數
 
-# 模擬期間的最後一天。到這一天會自動改用 settle（全數出清並印出結算報告）。
-SIM_LAST_DAY = datetime.date(2026, 9, 4)   # 下週五
+# 模擬沒有結束日期：每次執行就推進一天，持續累積，直到你自己決定收尾。
+# 想結算出清時，執行：python tw_stock_pipeline_v1.1.py --settle
+# 每週五會自動另存一份週報 Excel（不會出清部位，只是拍一張快照）。
+WEEKLY_REPORT_WEEKDAY = 4   # 0=週一 … 4=週五
 
 
 def _load_module(path: Path, module_name: str):
@@ -142,12 +148,21 @@ def _run_tool(script: Path, args: list[str], label: str) -> bool:
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="台股活躍股篩選 + 完整分析 + 紙上交易模擬 整合流程")
+    parser.add_argument("--settle", action="store_true",
+                        help="結算出清：把所有部位以今日收盤價賣出並印出完整報告。"
+                             "不加這個參數的話，模擬會一直跑下去，不會自己結束")
+    args = parser.parse_args()
+
     today = datetime.date.today()
-    is_last_day = today >= SIM_LAST_DAY
+    is_settle = args.settle
+    is_friday = today.weekday() == WEEKLY_REPORT_WEEKDAY
 
     print("=" * 64)
     print("台股活躍股篩選 + 完整分析 + 紙上交易模擬  整合流程 v1.1")
-    print(f"執行日期：{today}" + ("（模擬結算日）" if is_last_day else ""))
+    print(f"執行日期：{today}"
+          + ("（結算出清）" if is_settle else "（週五：會另存週報）" if is_friday else ""))
     print("=" * 64)
 
     # 先確認四支程式都找得到，缺什麼一次講清楚，不要跑到一半才失敗
@@ -246,10 +261,19 @@ def main():
         _run_tool(PAPER_TRADING, ["init", "--state", str(SIM_STATE),
                                   "--capital", "1000000"], "模擬初始化")
 
-    sim_cmd = "settle" if is_last_day else "step"
+    sim_cmd = "settle" if is_settle else "step"
     _run_tool(PAPER_TRADING, [sim_cmd, "--state", str(SIM_STATE),
                               "--date", today.isoformat(),
                               "--log", str(log_path)], "紙上交易模擬")
+
+    # 每週五拍一張快照存檔。不出清部位——出清只在 --settle 時才做，
+    # 這樣週報之間才有可比較的連續性。
+    weekly_path = None
+    if is_friday and not is_settle:
+        weekly_path = SCRIPT_DIR / f"模擬週報_{today.isoformat()}.xlsx"
+        print(f"\n  今天是週五，另存本週模擬週報...")
+        _run_tool(PAPER_TRADING, ["report", "--state", str(SIM_STATE),
+                                  "-o", str(weekly_path)], "週報輸出")
 
     # ------------------------------------------------------------
     # Step 4：回填前一日實際結果
@@ -271,17 +295,23 @@ def main():
         pt_cmd = PAPER_TRADING.relative_to(SCRIPT_DIR)
     except ValueError:
         pt_cmd = PAPER_TRADING
-    if is_last_day:
-        print(f"\n  ★ 今天是模擬結算日，上方已印出完整結算報告。")
-        print(f"     若要輸出 Excel 版本：")
-        print(f"       python {pt_cmd} report -o 模擬結算報告.xlsx")
+    if is_settle:
+        print(f"\n  ★ 已結算出清，上方為完整結算報告。")
+        print(f"     若要輸出 Excel：python {pt_cmd} report -o 模擬結算報告.xlsx")
+        print(f"     想重新開始一輪模擬：python {pt_cmd} init --state 新檔名.json --capital 1000000")
     else:
-        remaining = (SIM_LAST_DAY - today).days
-        print(f"\n  距離模擬結算日（{SIM_LAST_DAY}）還有 {remaining} 天。")
-        print(f"     隨時查看目前狀況：")
-        print(f"       python {pt_cmd} report")
-        print(f"\n  提醒：預測的目標日還沒到之前，log_review 沒有實際結果可以回填，")
-        print(f"  那是正常的。等 {next_trading_day_hint(today)} 收盤後再執行，就會開始有命中率統計。")
+        if weekly_path:
+            print(f"\n  ★ 本週模擬週報：{weekly_path.name}")
+        print(f"\n  模擬持續進行中，沒有結束日期。")
+        print(f"     隨時查看：python {pt_cmd} report")
+        print(f"     要收尾結算：python {Path(__file__).name} --settle")
+        nxt = next_trading_day_hint(today)
+        if today.weekday() != WEEKLY_REPORT_WEEKDAY:
+            days_to_fri = (WEEKLY_REPORT_WEEKDAY - today.weekday()) % 7
+            fri = today + datetime.timedelta(days=days_to_fri)
+            print(f"\n  下次週報：{fri}（週五）")
+        print(f"  提醒：預測的目標日還沒到之前，log_review 沒有實際結果可回填，")
+        print(f"  那是正常的。等 {nxt} 收盤後再執行，就會開始累積命中率統計。")
     print("\n免責聲明：本流程為技術整合與紙上推演，不下真單，")
     print("篩選、分析與模擬結果皆不構成投資建議，請自行判斷並承擔交易風險。")
 

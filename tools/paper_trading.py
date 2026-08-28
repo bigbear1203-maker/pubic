@@ -93,6 +93,12 @@ SHARES_PER_LOT = 1000
 STRATEGIES = ("strategy_decision", "ev_decision", "score_topn",
               "prob_topn", "active_equal", "cash")
 
+# 排名型策略：規則是「持有當下的前 N 名」，所以跌出名單就換掉。
+RANKING_STRATEGIES = ("score_topn", "prob_topn", "active_equal")
+# 訊號型策略：規則是「看到 Buy 才進場」，Wait 代表沒有意見，不是叫你賣，
+# 所以只在出現明確 Sell 或超過最長持有天數時才出場。
+SIGNAL_STRATEGIES = ("strategy_decision", "ev_decision")
+
 STRATEGY_DESC = {
     "strategy_decision": "只在 Strategy_Decision=Buy 時買進（現行規則）",
     "ev_decision": "只在 EV_Decision=Buy 時買進（v3.7 影子規則）",
@@ -334,6 +340,62 @@ def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int) -> list[tuple
     return []
 
 
+def pick_exits(strategy: str, signals: pd.DataFrame, positions: dict,
+               targets: list[tuple[str, str]], max_holding_days: int,
+               today: dt.date) -> dict:
+    """
+    決定今天要出場的部位。回傳 {symbol: 出場理由}。
+
+    為什麼需要這個：原本的模擬器只買不賣（除了停損），部位會一直卡著，
+    格子占滿之後就再也不會有新單。跑一週還看不出來，長期執行就會變成
+    「第一天買完之後什麼都不做」——那不是任何一個策略的規則。
+
+    出場條件分三類：
+      1. 時間停損：持有超過 max_holding_days 個日曆日一律出場。
+         這是防呆，避免任何部位被永久遺忘。
+      2. 排名型策略（score_topn / prob_topn / active_equal）：
+         跌出今日前 N 名就換掉。這些策略的規則本來就是「持有當下的
+         前 N 名」，不換股就等於沒有在執行那個規則。
+      3. 訊號型策略（strategy_decision / ev_decision）：
+         只有出現明確的 Sell 才出場。Wait 代表模型沒有意見，
+         不是叫你賣——把 Wait 當賣出訊號會造成大量無謂的來回，
+         而每一次來回都要付 0.47% 成本。
+    """
+    exits: dict[str, str] = {}
+    if not positions:
+        return exits
+
+    # 1. 時間停損（所有策略共用）
+    for sym, pos in positions.items():
+        try:
+            held = (today - dt.date.fromisoformat(str(pos["entry_date"]))).days
+        except (ValueError, TypeError):
+            continue
+        if held >= max_holding_days:
+            exits[sym] = f"持有滿 {held} 天，時間停損"
+
+    if signals is None or signals.empty:
+        return exits
+
+    # 2. 排名型：跌出名單就換股
+    if strategy in RANKING_STRATEGIES:
+        tgt = {sym for sym, _ in targets}
+        for sym in positions:
+            if sym not in tgt and sym not in exits:
+                exits[sym] = "已跌出今日名單，換股"
+
+    # 3. 訊號型：只認明確的 Sell
+    elif strategy in SIGNAL_STRATEGIES:
+        col = "Strategy_Decision" if strategy == "strategy_decision" else "EV_Decision"
+        if col in signals.columns:
+            sell_syms = set(signals.loc[signals[col] == "Sell", "股票代碼"])
+            for sym in positions:
+                if sym in sell_syms and sym not in exits:
+                    exits[sym] = f"{col}=Sell"
+
+    return exits
+
+
 # ============================================================
 # 模擬器
 # ============================================================
@@ -350,7 +412,7 @@ class Simulator:
     @classmethod
     def create(cls, capital: float, top_n: int, max_position_pct: float,
                stop_loss_pct: float, stop_loss_atr: float, allow_odd_lot: bool,
-               fee_discount: float) -> "Simulator":
+               fee_discount: float, max_holding_days: int = 10) -> "Simulator":
         state = {
             "version": 1,
             "created": dt.datetime.now().isoformat(timespec="seconds"),
@@ -362,6 +424,7 @@ class Simulator:
                 "stop_loss_atr": stop_loss_atr,
                 "allow_odd_lot": allow_odd_lot,
                 "fee_discount": fee_discount,
+                "max_holding_days": max_holding_days,
             },
             "portfolios": {n: Portfolio(n, capital).to_dict() for n in STRATEGIES},
             "processed_dates": [],
@@ -380,7 +443,9 @@ class Simulator:
 
     @property
     def cfg(self) -> dict:
-        return self.state["config"]
+        c = self.state["config"]
+        c.setdefault("max_holding_days", 10)   # 舊狀態檔相容
+        return c
 
     # ---------- 每日流程 ----------
     def step(self, date: dt.date, log_path: Path | None,
@@ -423,7 +488,7 @@ class Simulator:
             if not p.pending:
                 continue
             filled, failed = 0, 0
-            for order in p.pending:
+            for order in self._sell_first(p.pending):
                 px = prices.get(order["symbol"], {}).get("open")
                 if px is None:
                     failed += 1
@@ -478,11 +543,17 @@ class Simulator:
             else:
                 print(f"      可用訊號 {len(signals)} 檔")
                 for name, p in self.portfolios.items():
-                    orders = self._build_orders(name, p, signals, prices)
-                    p.pending = orders
+                    orders = self._build_orders(name, p, signals, prices, date)
+                    p.pending = self._sell_first(orders)
                     if orders:
-                        detail = "、".join(f"{o['symbol']}" for o in orders[:6])
-                        print(f"      {name:18s} 明日買進 {len(orders)} 檔：{detail}")
+                        buys = [o["symbol"] for o in orders if o["side"] == "buy"]
+                        sells = [o["symbol"] for o in orders if o["side"] == "sell"]
+                        parts = []
+                        if sells:
+                            parts.append(f"賣出 {len(sells)} 檔（{'、'.join(sells[:4])}）")
+                        if buys:
+                            parts.append(f"買進 {len(buys)} 檔（{'、'.join(buys[:4])}）")
+                        print(f"      {name:18s} 明日 {'，'.join(parts)}")
                     else:
                         print(f"      {name:18s} 明日無新單")
 
@@ -546,26 +617,43 @@ class Simulator:
         return stopped
 
     def _build_orders(self, strategy: str, p: Portfolio, signals: pd.DataFrame,
-                      prices: dict) -> list[dict]:
+                      prices: dict, today: dt.date) -> list[dict]:
+        """
+        產生明日的委託單。賣單排在買單前面，撮合時先賣後買，
+        讓換股釋放出來的現金當天就能用。
+        """
         targets = pick_targets(strategy, signals, self.cfg["top_n"])
-        if not targets:
-            return []
+        exits = pick_exits(strategy, signals, p.positions, targets,
+                           self.cfg["max_holding_days"], today)
 
-        # 已持有的不重複買進
-        targets = [(s, r) for s, r in targets if s not in p.positions]
-        if not targets:
-            return []
+        orders: list[dict] = [
+            {"symbol": sym, "side": "sell", "reason": reason}
+            for sym, reason in exits.items()
+        ]
 
-        slots = max(self.cfg["top_n"] - len(p.positions), 0)
+        if not targets:
+            return orders
+
+        # 已持有且不打算賣掉的，不重複買進
+        holding_after = {s for s in p.positions if s not in exits}
+        targets = [(s, r) for s, r in targets if s not in holding_after]
+        if not targets:
+            return orders
+
+        slots = max(self.cfg["top_n"] - len(holding_after), 0)
         targets = targets[:slots]
         if not targets:
-            return []
+            return orders
 
         equity = p.equity(prices) or self.state["initial_capital"]
-        budget = min(p.cash * 0.995 / len(targets),
+        # 換股賣出後會有現金進來，所以預算用「權益 ÷ 目標檔數」而不是
+        # 只看當下現金——否則換股當天會因為錢還沒回來而買不進去。
+        budget = min(equity * 0.98 / max(self.cfg["top_n"], 1),
                      equity * self.cfg["max_position_pct"])
 
-        orders = []
+        # 注意：這裡要 append 到既有的 orders（裡面已經有賣單），
+        # 不能重新指派成空 list——那會把換股的賣單整個清掉，
+        # 結果就是「只買不賣、部位無限累積、還會超過 top_n 上限」。
         # 只帶 ATR 值，不預先算停損價——停損必須以「實際成交價」為基準。
         # 訊號是 D 日收盤後產生的，D+1 開盤價可能跳空，若拿 D 日收盤價去算
         # 停損線，遇到跳空就會算出高於成交價的停損價，一買進當天就被掃出場。
@@ -577,6 +665,10 @@ class Simulator:
                 "atr": None if atr is None or pd.isna(atr) else float(atr),
             })
         return orders
+
+    @staticmethod
+    def _sell_first(orders: list[dict]) -> list[dict]:
+        return sorted(orders, key=lambda o: 0 if o.get("side") == "sell" else 1)
 
     # ---------- 報告 ----------
     def summary(self) -> pd.DataFrame:
@@ -637,6 +729,50 @@ class Simulator:
                 rows.append({"策略": name, **t})
         return pd.DataFrame(rows)
 
+    def weekly_summary(self) -> pd.DataFrame:
+        """
+        以「週」為單位的績效表：每一週最後一個交易日的權益，對比前一週。
+
+        長期執行時，逐日權益曲線太細碎看不出東西，累計報酬又會被早期
+        的一次大賺大賠主導。用週為單位剛好——既看得出趨勢，也還原得出
+        「這一週發生了什麼」。權益一律採用扣除出清成本後的淨值，
+        跟報告其他地方的口徑一致。
+        """
+        curves = self.all_curves()
+        if curves.empty:
+            return pd.DataFrame()
+
+        c = curves.copy()
+        c["_d"] = pd.to_datetime(c["date"])
+        iso = c["_d"].dt.isocalendar()
+        c["週別"] = iso["year"].astype(str) + "-W" + iso["week"].astype(str).str.zfill(2)
+
+        fee_d = self.cfg["fee_discount"]
+        sell_rate = FEE_RATE * fee_d + TAX_SELL
+        # 週末最後一天的持股市值要扣掉出清成本才是可比較的淨值
+        c["淨權益"] = c["equity"] - (c["equity"] - c["cash"]).clip(lower=0) * sell_rate
+
+        rows = []
+        cap = self.state["initial_capital"]
+        for name, g in c.groupby("策略", sort=False):
+            g = g.sort_values("_d")
+            prev = cap
+            for wk, wg in g.groupby("週別", sort=True):
+                last = wg.iloc[-1]
+                rows.append({
+                    "週別": wk,
+                    "起": wg.iloc[0]["date"],
+                    "訖": last["date"],
+                    "交易日數": len(wg),
+                    "策略": name,
+                    "週末淨權益": last["淨權益"],
+                    "本週報酬(%)": (last["淨權益"] / prev - 1) * 100 if prev else np.nan,
+                    "累計報酬(%)": (last["淨權益"] / cap - 1) * 100,
+                    "週末持股數": int(last["n_positions"]),
+                })
+                prev = last["淨權益"]
+        return pd.DataFrame(rows)
+
     def all_curves(self) -> pd.DataFrame:
         rows = []
         for name, p in self.portfolios.items():
@@ -681,6 +817,18 @@ def print_report(sim: Simulator) -> None:
         print("     「報酬率(%)」也是以它計算。兩者可以差 0.4% 以上——在一週報酬率")
         print("     本來就只有正負 1% 的尺度下，這個差距足以讓帳面的賺變成實際的賠。")
 
+    # 長期執行時，週轉率是最容易被忽略、也最容易致命的一項
+    heavy = s[(s["成本佔初始資金(%)"] > 1.0)]
+    if len(heavy) and n_days:
+        print(f"\n  ⚠ 交易成本警示（累計成本已超過本金 1%）：")
+        for _, r in heavy.sort_values("成本佔初始資金(%)", ascending=False).iterrows():
+            per_year = r["成本佔初始資金(%)"] / n_days * 250
+            print(f"    {r['策略']:18s} 累計成本 {r['累計交易成本']:>10,.0f} 元"
+                  f"（本金的 {r['成本佔初始資金(%)']:.2f}%），"
+                  f"以目前週轉速度年化約 {per_year:.1f}%")
+        print(f"    台股來回一趟 {round_trip_cost_pct():.2f}%，換股越勤成本吃得越兇。")
+        print(f"    若某策略報酬贏不過它自己的成本，那個規則就是在幫券商賺錢。")
+
     cash_row = s[s["策略"] == "cash"]
     if not cash_row.empty:
         base = float(cash_row["報酬率(%)"].iloc[0])
@@ -697,12 +845,29 @@ def print_report(sim: Simulator) -> None:
         print(f"  輸給：{len(lose)} 個"
               + (f"（{'、'.join(lose['策略'])}）" if len(lose) else ""))
 
+    weekly = sim.weekly_summary()
+    if not weekly.empty and weekly["週別"].nunique() >= 1:
+        print(f"\n【週績效】（每週最後一個交易日的淨權益，已扣出清成本）")
+        pivot = weekly.pivot(index="週別", columns="策略", values="本週報酬(%)")
+        order = [c for c in STRATEGIES if c in pivot.columns]
+        print(pivot[order].to_string(float_format=lambda v: f"{v:+.2f}"))
+        last_wk = weekly["週別"].max()
+        lw = weekly[weekly["週別"] == last_wk].sort_values("本週報酬(%)", ascending=False)
+        print(f"\n  最近一週（{last_wk}，{lw.iloc[0]['起']} ~ {lw.iloc[0]['訖']}，"
+              f"{lw.iloc[0]['交易日數']} 個交易日）排名：")
+        for _, r in lw.iterrows():
+            print(f"    {r['策略']:18s} 本週 {r['本週報酬(%)']:+6.2f}%"
+                  f"　累計 {r['累計報酬(%)']:+6.2f}%　持股 {r['週末持股數']} 檔")
+
     trades = sim.all_trades()
     if not trades.empty:
         print(f"\n【交易明細】共 {len(trades)} 筆")
         cols = [c for c in ["策略", "date", "symbol", "side", "shares", "price",
                             "cost", "報酬率(%)", "reason"] if c in trades.columns]
-        print(trades[cols].to_string(index=False, max_colwidth=32))
+        shown = trades.sort_values("date").tail(25)
+        if len(trades) > 25:
+            print(f"  （只列最近 25 筆，完整明細請用 -o 匯出 Excel）")
+        print(shown[cols].to_string(index=False, max_colwidth=32))
     else:
         print(f"\n【交易明細】整個模擬期間沒有任何交易。")
         print("  如果這是 strategy_decision 造成的，那正是這次模擬要看到的結果：")
@@ -732,6 +897,11 @@ def write_report(sim: Simulator, path: Path) -> None:
         trades = sim.all_trades()
         if not trades.empty:
             trades.to_excel(w, sheet_name="交易明細", index=False)
+        weekly = sim.weekly_summary()
+        if not weekly.empty:
+            weekly.to_excel(w, sheet_name="週績效", index=False)
+            weekly.pivot(index="週別", columns="策略",
+                         values="本週報酬(%)").to_excel(w, sheet_name="週報酬對照")
         curves = sim.all_curves()
         if not curves.empty:
             curves.to_excel(w, sheet_name="每日權益", index=False)
@@ -823,6 +993,8 @@ def main(argv=None) -> int:
     p_init.add_argument("--lot-only", action="store_true",
                         help="只買整張（1000股）。預設允許零股，因為 100 萬買不起一張台積電")
     p_init.add_argument("--fee-discount", type=float, default=FEE_DISCOUNT)
+    p_init.add_argument("--max-holding-days", type=int, default=10,
+                        help="最長持有天數（日曆日），超過一律出場。防止部位被永久遺忘")
 
     for name, helptext in (("step", "執行一個交易日"), ("settle", "執行最後一天並結算出清")):
         pp = sub.add_parser(name, help=helptext)
@@ -853,11 +1025,14 @@ def main(argv=None) -> int:
             return 1
         sim = Simulator.create(args.capital, args.top_n, args.max_position_pct,
                                args.stop_loss_pct, args.stop_loss_atr,
-                               not args.lot_only, args.fee_discount)
+                               not args.lot_only, args.fee_discount,
+                               args.max_holding_days)
         sim.save(args.state)
         print(f"✓ 已建立模擬：{args.state}")
         print(f"  初始資金：{args.capital:,.0f} 元 × {len(STRATEGIES)} 個獨立策略帳戶")
         print(f"  每帳戶最多持有 {args.top_n} 檔，單一標的上限 {args.max_position_pct:.0%}")
+        print(f"  最長持有 {args.max_holding_days} 天；排名型策略跌出名單即換股")
+        print(f"  無結束日期，持續執行到你自己下 settle 為止")
         print(f"  零股交易：{'否（只買整張）' if args.lot_only else '是'}")
         print(f"  台股來回成本：約 {round_trip_cost_pct(args.fee_discount):.3f}%")
         print(f"\n策略清單：")
