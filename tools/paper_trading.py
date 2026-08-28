@@ -708,10 +708,65 @@ def write_report(sim: Simulator, path: Path) -> None:
 # CLI
 # ============================================================
 
+def _print_usage_guide(state_path: Path) -> None:
+    """
+    沒有帶子指令時印出的說明。直接用 VS Code 的 ▶ Run 按鈕執行會走到這裡，
+    所以這裡要印出「可以直接複製貼上」的完整指令，而不是抽象的用法字串。
+    """
+    exe = sys.executable
+    me = Path(__file__).resolve()
+    prefix = f'& "{exe}" "{me}"' if " " in exe or " " in str(me) else f"{exe} {me}"
+
+    print("=" * 70)
+    print("  台股紙上交易模擬器 — 這支程式需要指定「要做什麼」")
+    print("=" * 70)
+    print("\n這不是錯誤，只是你還沒告訴它要執行哪個動作。")
+    print("VS Code 右上角的 ▶ Run 按鈕不會帶參數，所以請改用終端機輸入指令。")
+
+    exists = state_path.exists()
+    print(f"\n目前模擬狀態檔：{state_path}")
+    print(f"  {'✓ 已存在，可以直接推進交易日' if exists else '✗ 尚未建立，請先執行下面的 init'}")
+
+    print("\n" + "-" * 70)
+    if not exists:
+        print("【下一步：建立模擬】把下面這一整行複製到終端機執行\n")
+        print(f"  {prefix} init --capital 1000000\n")
+    else:
+        print("【下一步：每天收盤後推進一個交易日】\n")
+        print(f"  {prefix} step --date {dt.date.today().isoformat()}\n")
+        print("  （通常不必手動下這一行，執行 tw_stock_pipeline_v1.1.py 會自動呼叫）\n")
+    print("-" * 70)
+
+    print("\n所有可用的子指令：")
+    for cmd, desc in (
+        ("init", "建立新的模擬（100 萬 × 6 個獨立策略帳戶），只需執行一次"),
+        ("step", "推進一個交易日：撮合昨日委託、標記市值、產生明日委託"),
+        ("settle", "最後一天結算：全數出清並印出完整報告"),
+        ("report", "印出目前績效報告，可加 -o 檔名.xlsx 匯出"),
+        ("status", "查看目前現金、持股與待成交委託單"),
+    ):
+        print(f"  {cmd:8s} {desc}")
+
+    print("\n常用範例：")
+    print(f"  {prefix} init --capital 1000000")
+    print(f"  {prefix} status")
+    print(f"  {prefix} report -o 模擬結算報告.xlsx")
+    print(f"  {prefix} settle --date 2026-09-04")
+
+    print("\n若想少打一點字，可以先切換到程式所在資料夾：")
+    print(f"  cd \"{me.parent}\"")
+    print(f"  python {me.name} init --capital 1000000")
+    print("\n完整說明：docs/模擬投資使用說明.md")
+    print("=" * 70)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="台股紙上交易模擬器")
     ap.add_argument("--state", type=Path, default=None, help="狀態檔路徑")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # 刻意不設 required=True：直接用 VS Code 的 ▶ Run 按鈕執行時不會帶參數，
+    # argparse 預設的錯誤訊息（"the following arguments are required: cmd"）
+    # 對不熟指令列的使用者幫助有限。改成印出可直接複製的完整指令。
+    sub = ap.add_subparsers(dest="cmd", required=False)
 
     def _add_state(parser):
         # --state 放在子指令前後都能用，免得每次都要記位置
@@ -747,6 +802,10 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if getattr(args, "state", None) is None:
         args.state = DEFAULT_STATE
+
+    if args.cmd is None:
+        _print_usage_guide(args.state)
+        return 0
 
     if args.cmd == "init":
         if args.state.exists():
