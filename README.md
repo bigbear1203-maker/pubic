@@ -7,11 +7,15 @@
 | 路徑 | 說明 |
 |---|---|
 | `claude_stock_analyzer_v3.7.py` | **修正版程式**。診斷出的問題都已套用，可直接取代 v3.6 使用 |
+| `tw_stock_pipeline_v1.1.py` | 整合流程：活躍股篩選 → 完整分析 → 紙上交易模擬 → 結果回填，每天一支指令跑完 |
+| `tools/paper_trading.py` | **100 萬紙上交易模擬器**。6 個獨立策略帳戶平行比較，含「什麼都不做」對照組 |
+| `docs/模擬投資使用說明.md` | 下週（8/31～9/4）的每日操作手冊與週五判讀指引 |
 | `docs/程式診斷報告.md` | 以 80 筆實際紀錄為證的完整診斷：4 個致命問題、4 個結構性問題、6 個次要問題，以及做得好不該改掉的部分 |
 | `docs/v3.7變更說明.md` | v3.6 → v3.7 每一項修改與診斷項目的對照表，以及**刻意沒改**的東西與理由 |
 | `docs/投資策略使用指南.md` | 以投資者角度：現在能／不能拿它做什麼、接下來 6 週該做什麼、沒有優勢時該換什麼題目 |
 | `tools/log_review.py` | **回測驗證工具**。把 `stock_analysis_log.xlsx` 變成「這套系統到底準不準」的量化答案，並可 `--write-back` 回填實際結果 |
-| `tests/test_v37_offline.py` | v3.7 的離線測試（不需網路），驗證每項修正確實生效 |
+| `tests/test_v37_offline.py` | v3.7 的離線測試（不需網路），52 項檢查 |
+| `tests/test_paper_trading.py` | 模擬器的離線測試，50 項檢查（含成本、停損、端到端整週流程） |
 | `samples/` | 診斷所用的實際紀錄檔（2026-08-26 ～ 08-28，80 筆） |
 
 ## 快速開始
@@ -29,6 +33,20 @@ python tools/log_review.py stock_analysis_log_v3.7.xlsx --write-back
 # 只看診斷、不回填（用附帶的樣本資料）
 python tools/log_review.py samples/stock_analysis_log_20260828.xlsx --mode offline
 ```
+
+### 100 萬紙上交易模擬（下週 8/31～9/4）
+
+```bash
+python tools/paper_trading.py init --capital 1000000   # 只做一次
+python tw_stock_pipeline_v1.1.py                       # 每個交易日收盤後執行
+python tools/paper_trading.py report -o 模擬結算報告.xlsx  # 週五結算
+```
+
+同一筆 100 萬同時跑 6 個獨立策略帳戶（含「什麼都不做」對照組）。
+詳見 [`docs/模擬投資使用說明.md`](docs/模擬投資使用說明.md)。
+
+**一週的結果在統計上等於零** —— 5 個交易日、有效獨立樣本數約 1。
+這次模擬的價值在於驗證流程與逼出實務問題，不在於名次。
 
 ## 四個最重要的發現
 
