@@ -1,0 +1,499 @@
+# -*- coding: utf-8 -*-
+"""
+台股活躍股預測程式 v3.0
+========================
+改良重點：
+1. 僅使用證交所官方 API（TWSE）
+2. 排除 ETF / ETN / 權證 / 指數商品（以代碼規則初步過濾）
+3. 回看天數拉長，降低短樣本噪音
+4. 對極端值做 log + clipping，避免量比暴衝扭曲排序
+5. 設定最低歷史樣本門檻，避免資料不足股票進榜
+6. 預測採用「最近平均分數 + 趨勢斜率 * 趨勢可信度(r2)」
+   比單純 latest + slope 更穩健
+7. Excel 輸出包含更多解釋欄位
+
+注意：
+- 本程式仍屬「活躍度排序/觀察工具」，不是投資報酬預測模型
+- 不構成任何投資建議
+"""
+
+import time
+import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+
+# ============================================================
+# 參數設定區
+# ============================================================
+
+LOOKBACK_DAYS = 30          # 回看近幾個有效交易日
+MIN_HISTORY_DAYS = 15       # 至少需要幾天資料才納入預測
+TOP_N = 10                  # 輸出前幾名
+ROLLING_BASE_DAYS = 10      # 量比比較基準：前 N 日均量
+RECENT_AVG_DAYS = 3         # 最近幾日平均分數
+
+# 活躍度分數權重（總和建議 = 1.0）
+WEIGHT_TRADING_MONEY = 0.40
+WEIGHT_VOLUME_RATIO = 0.25
+WEIGHT_TURNOVER_COUNT = 0.20
+WEIGHT_AMPLITUDE = 0.15
+
+# clipping 分位數，降低極端值影響
+CLIP_LOWER_Q = 0.01
+CLIP_UPPER_Q = 0.99
+
+OUTPUT_DIR = Path(__file__).resolve().parent
+OUTPUT_FILE = OUTPUT_DIR / f"台股活躍股預測_v3_{datetime.date.today().isoformat()}.xlsx"
+
+TWSE_URL = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
+NEEDED_COLUMNS = {
+    "證券代號": "stock_id",
+    "證券名稱": "stock_name",
+    "成交股數": "Trading_Volume",
+    "成交筆數": "Trading_turnover",
+    "成交金額": "Trading_money",
+    "開盤價": "open",
+    "最高價": "max",
+    "最低價": "min",
+    "收盤價": "close",
+}
+
+# ============================================================
+# 工具函式
+# ============================================================
+
+def zscore(s: pd.Series) -> pd.Series:
+    """標準化：(x - mean) / std，std=0 時回傳全 0"""
+    s = pd.to_numeric(s, errors="coerce")
+    std = s.std(ddof=0)
+    if std == 0 or np.isnan(std):
+        return pd.Series(0.0, index=s.index)
+    return (s - s.mean()) / std
+
+
+def clip_series(s: pd.Series, lower_q=CLIP_LOWER_Q, upper_q=CLIP_UPPER_Q) -> pd.Series:
+    """依分位數裁剪極端值"""
+    s = pd.to_numeric(s, errors="coerce")
+    low = s.quantile(lower_q)
+    high = s.quantile(upper_q)
+    return s.clip(lower=low, upper=high)
+
+
+def safe_log1p(s: pd.Series) -> pd.Series:
+    """非負數取 log1p，若有負值先轉 NaN"""
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.where(s >= 0, np.nan)
+    return np.log1p(s)
+
+
+def calc_r2(x: np.ndarray, y: np.ndarray, slope: float, intercept: float) -> float:
+    """計算線性回歸擬合度 R^2"""
+    y_pred = slope * x + intercept
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    if ss_tot == 0:
+        return 0.0
+    return max(0.0, 1 - ss_res / ss_tot)
+
+
+def is_common_stock(stock_id: str, stock_name: str = "") -> bool:
+    """
+    以代碼規則初步過濾：
+    只保留較像一般上市普通股的標的，排除 ETF / ETN / 權證 / 指數商品 / 特殊商品
+    說明：
+    - 台股一般上市普通股多為 4 位數字，例如 2330、2454、2301
+    - ETF 常見為 0050、006208 等 5~6 碼
+    - ETN 常見 020xxx
+    - 權證常為 6 碼以上且命名有特徵
+    """
+    sid = str(stock_id).strip()
+    name = str(stock_name).strip()
+
+    if not sid.isdigit():
+        return False
+
+    # 普通股通常是 4 碼
+    if len(sid) != 4:
+        return False
+
+    # 名稱再做一層保護性排除
+    excluded_keywords = [
+        "ETF", "ETN", "權證", "反1", "正2", "槓桿", "反向", "期", "特別股"
+    ]
+    if any(k in name for k in excluded_keywords):
+        return False
+
+    return True
+
+
+# ============================================================
+# 資料抓取（證交所官方公開 API）
+# ============================================================
+
+def fetch_twse_day(date_str: str) -> pd.DataFrame:
+    """
+    抓取指定日期（YYYYMMDD）全部上市股票的日成交資料。
+    若當天是假日或無資料，回傳 None。
+    """
+    params = {"response": "json", "date": date_str, "type": "ALLBUT0999"}
+
+    try:
+        resp = requests.get(TWSE_URL, params=params, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"    {date_str} 抓取失敗：{e}")
+        return None
+
+    if data.get("stat") != "OK":
+        return None
+
+    tables = data.get("tables", [])
+    target_table = None
+    for t in tables:
+        if isinstance(t, dict) and "證券代號" in t.get("fields", []):
+            target_table = t
+            break
+
+    if target_table is None:
+        return None
+
+    rows = target_table.get("data", [])
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, columns=target_table["fields"])
+
+    missing = [c for c in NEEDED_COLUMNS if c not in df.columns]
+    if missing:
+        print(f"    警告：{date_str} 缺少欄位 {missing}，此日資料略過")
+        return None
+
+    df = df[list(NEEDED_COLUMNS.keys())].rename(columns=NEEDED_COLUMNS)
+
+    numeric_cols = [
+        "Trading_Volume",
+        "Trading_turnover",
+        "Trading_money",
+        "open",
+        "max",
+        "min",
+        "close",
+    ]
+
+    for col in numeric_cols:
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+            .replace({"--": np.nan, "---": np.nan, "": np.nan})
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["date"] = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    df = df.dropna(subset=["close"])
+    df = df[df["close"] > 0]
+
+    # 只保留一般普通股，先排除 ETF / ETN / 權證等
+    df = df[df.apply(lambda r: is_common_stock(r["stock_id"], r["stock_name"]), axis=1)]
+
+    return df.reset_index(drop=True)
+
+
+def fetch_panel_data(n_days: int) -> pd.DataFrame:
+    """從昨天開始往前找，直到湊滿 n_days 個有效交易日資料"""
+    frames = []
+    current = datetime.date.today() - datetime.timedelta(days=1)
+    attempts = 0
+    max_attempts = n_days * 3 + 20
+
+    while len(frames) < n_days and attempts < max_attempts:
+        attempts += 1
+
+        if current.weekday() < 5:
+            date_str = current.strftime("%Y%m%d")
+            print(f"  嘗試抓取 {date_str} ...")
+            df = fetch_twse_day(date_str)
+
+            if df is not None and not df.empty:
+                print(f"    OK，取得 {len(df)} 檔普通股資料")
+                frames.append(df)
+            else:
+                print("    無資料（可能是假日/停市/欄位異常），略過")
+
+            time.sleep(1.0)
+
+        current -= datetime.timedelta(days=1)
+
+    if len(frames) < n_days:
+        print(f"  警告：只湊到 {len(frames)} 個有效交易日（原訂 {n_days} 天），將以實際天數繼續分析")
+
+    if not frames:
+        raise RuntimeError("完全抓不到任何交易日資料，請檢查網路連線或證交所服務狀態")
+
+    frames = list(reversed(frames))
+    panel = pd.concat(frames, ignore_index=True)
+
+    # 防止同日重複
+    panel = panel.drop_duplicates(subset=["date", "stock_id"]).reset_index(drop=True)
+    return panel
+
+
+# ============================================================
+# 活躍度計算
+# ============================================================
+
+def compute_daily_scores(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    對每個交易日，計算每檔股票的活躍指標：
+    1. 成交值（log後）
+    2. 量比（相對前 N 日均量，log後）
+    3. 成交筆數（log後）
+    4. 振幅
+
+    然後在每日截面上標準化，加權合成 activity_score
+    """
+    df = panel.copy()
+    df = df.sort_values(["stock_id", "date"]).reset_index(drop=True)
+
+    # 振幅
+    mid = (df["max"] + df["min"]) / 2
+    mid = mid.replace(0, np.nan)
+    df["amplitude"] = (df["max"] - df["min"]) / mid
+    df["amplitude"] = df["amplitude"].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # 前N日均量（不含當日）
+    df["volume_ma_prior"] = (
+        df.groupby("stock_id")["Trading_Volume"]
+        .transform(lambda s: s.shift(1).rolling(ROLLING_BASE_DAYS, min_periods=3).mean())
+    )
+
+    # 今日量 / 前均量
+    df["volume_ratio"] = df["Trading_Volume"] / df["volume_ma_prior"]
+    df["volume_ratio"] = df["volume_ratio"].replace([np.inf, -np.inf], np.nan)
+    df["volume_ratio"] = df["volume_ratio"].fillna(1.0)
+
+    scored_frames = []
+
+    for d, day_df in df.groupby("date"):
+        day_df = day_df.copy()
+
+        # 極端值處理 + log 轉換
+        day_df["money_feat"] = safe_log1p(clip_series(day_df["Trading_money"]))
+        day_df["turnover_feat"] = safe_log1p(clip_series(day_df["Trading_turnover"]))
+        day_df["vratio_feat"] = np.log(day_df["volume_ratio"].clip(lower=0.2, upper=5.0))
+        day_df["amplitude_feat"] = clip_series(day_df["amplitude"], 0.01, 0.99)
+
+        # 再做 z-score
+        day_df["z_money"] = zscore(day_df["money_feat"])
+        day_df["z_volume_ratio"] = zscore(day_df["vratio_feat"])
+        day_df["z_turnover_count"] = zscore(day_df["turnover_feat"])
+        day_df["z_amplitude"] = zscore(day_df["amplitude_feat"])
+
+        # 加權活躍度分數
+        day_df["activity_score"] = (
+            WEIGHT_TRADING_MONEY * day_df["z_money"]
+            + WEIGHT_VOLUME_RATIO * day_df["z_volume_ratio"]
+            + WEIGHT_TURNOVER_COUNT * day_df["z_turnover_count"]
+            + WEIGHT_AMPLITUDE * day_df["z_amplitude"]
+        )
+
+        scored_frames.append(day_df)
+
+    return pd.concat(scored_frames, ignore_index=True)
+
+
+# ============================================================
+# 預測/排序
+# ============================================================
+
+def predict_next_day_activity(scored: pd.DataFrame) -> pd.DataFrame:
+    """
+    改良版：
+    - 不再直接用 latest_score + slope
+    - 改用：
+        recent_avg_score = 最近幾日平均分數
+        slope = 線性回歸斜率
+        r2 = 趨勢擬合度
+        trend_strength = r2
+        predicted_next_score = recent_avg_score + slope * trend_strength
+
+    這樣做的原因：
+    - recent_avg_score 比單日 latest_score 穩
+    - slope 只有在擬合度高時才有較大權重
+    """
+    results = []
+
+    for stock_id, g in scored.groupby("stock_id"):
+        g = g.sort_values("date").reset_index(drop=True)
+
+        if len(g) < MIN_HISTORY_DAYS:
+            continue
+
+        y = g["activity_score"].values.astype(float)
+        x = np.arange(len(g), dtype=float)
+
+        if len(y) < 2:
+            continue
+
+        slope, intercept = np.polyfit(x, y, 1)
+        r2 = calc_r2(x, y, slope, intercept)
+        trend_strength = max(0.0, min(1.0, r2))
+
+        latest_score = float(y[-1])
+        recent_avg_score = float(np.mean(y[-RECENT_AVG_DAYS:]))
+
+        # 比較穩健的外推
+        predicted_score = recent_avg_score + slope * trend_strength
+
+        results.append(
+            {
+                "stock_id": stock_id,
+                "stock_name": g["stock_name"].iloc[-1],
+                "predicted_next_score": predicted_score,
+                "recent_avg_score": recent_avg_score,
+                "latest_score": latest_score,
+                "trend_slope": slope,
+                "trend_r2": r2,
+                "trend_strength": trend_strength,
+                "days_used": len(g),
+                "latest_trading_money": g["Trading_money"].iloc[-1],
+                "latest_volume": g["Trading_Volume"].iloc[-1],
+                "latest_volume_ratio": g["volume_ratio"].iloc[-1],
+                "latest_amplitude": g["amplitude"].iloc[-1],
+                "latest_date": g["date"].iloc[-1],
+            }
+        )
+
+    result_df = pd.DataFrame(results)
+
+    if result_df.empty:
+        return result_df
+
+    # 排序優先：預測分數，再看 recent_avg_score
+    result_df = result_df.sort_values(
+        ["predicted_next_score", "recent_avg_score"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    return result_df
+
+
+# ============================================================
+# 主流程
+# ============================================================
+
+def main():
+    print("=" * 72)
+    print("台股活躍股預測程式 v3.0（TWSE 官方 API／僅普通上市股）")
+    print("=" * 72)
+
+    print(f"\n[1/4] 抓取近 {LOOKBACK_DAYS} 個有效交易日全市場資料...")
+    panel = fetch_panel_data(LOOKBACK_DAYS)
+    unique_dates = sorted(panel["date"].unique())
+    print(f"  共取得 {len(panel):,} 筆資料，涵蓋日期：{unique_dates[0]} ~ {unique_dates[-1]}")
+    print(f"  股票數（去重後）：{panel['stock_id'].nunique():,}")
+
+    print("\n[2/4] 計算活躍度分數...")
+    scored = compute_daily_scores(panel)
+
+    print("\n[3/4] 計算趨勢並預測次日活躍度...")
+    predicted = predict_next_day_activity(scored)
+
+    if predicted.empty:
+        print("  沒有符合最低歷史天數門檻的股票，請增加 LOOKBACK_DAYS 或降低 MIN_HISTORY_DAYS。")
+        return
+
+    topn = predicted.head(TOP_N).copy()
+    topn.insert(0, "rank", range(1, len(topn) + 1))
+
+    print(f"\n[4/4] 預測次日活躍度前 {TOP_N} 名：")
+    print("-" * 72)
+    for _, row in topn.iterrows():
+        print(
+            f"{int(row['rank']):>2}. {row['stock_id']} {row['stock_name']}"
+            f"  預測分數={row['predicted_next_score']:.2f}"
+            f"  近{RECENT_AVG_DAYS}日均分={row['recent_avg_score']:.2f}"
+            f"  最新分數={row['latest_score']:.2f}"
+            f"  斜率={row['trend_slope']:+.3f}"
+            f"  R2={row['trend_r2']:.3f}"
+        )
+
+    display_cols = [
+        "rank",
+        "stock_id",
+        "stock_name",
+        "predicted_next_score",
+        "recent_avg_score",
+        "latest_score",
+        "trend_slope",
+        "trend_r2",
+        "trend_strength",
+        "days_used",
+        "latest_trading_money",
+        "latest_volume",
+        "latest_volume_ratio",
+        "latest_amplitude",
+        "latest_date",
+    ]
+
+    full_display_cols = [c for c in display_cols if c != "rank"]
+
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        topn[display_cols].to_excel(writer, sheet_name="活躍度前10名", index=False)
+        predicted[full_display_cols].to_excel(writer, sheet_name="全市場排名(普通股)", index=False)
+
+        params_df = pd.DataFrame(
+            {
+                "參數": [
+                    "分析日期",
+                    "資料來源",
+                    "涵蓋範圍",
+                    "回看有效交易日數",
+                    "最低歷史天數門檻",
+                    "量比基準天數",
+                    "最近均分天數",
+                    "成交值權重",
+                    "量比權重",
+                    "成交筆數權重",
+                    "振幅權重",
+                    "實際使用交易日",
+                ],
+                "數值": [
+                    datetime.date.today().isoformat(),
+                    "證交所官方公開 API (twse.com.tw)",
+                    "僅普通上市股（初步排除 ETF/ETN/權證/特殊商品）",
+                    LOOKBACK_DAYS,
+                    MIN_HISTORY_DAYS,
+                    ROLLING_BASE_DAYS,
+                    RECENT_AVG_DAYS,
+                    WEIGHT_TRADING_MONEY,
+                    WEIGHT_VOLUME_RATIO,
+                    WEIGHT_TURNOVER_COUNT,
+                    WEIGHT_AMPLITUDE,
+                    ", ".join(unique_dates),
+                ],
+            }
+        )
+        params_df.to_excel(writer, sheet_name="參數設定", index=False)
+
+    print(f"\n完成！結果已輸出至：{OUTPUT_FILE}")
+    print("\n免責聲明：")
+    print("1. 本程式為活躍度排序與觀察工具，不是投資報酬預測模型。")
+    print("2. 所謂『預測』為基於近期活躍度趨勢的簡化外推，僅供技術參考。")
+    print("3. 不構成任何投資建議，請自行判斷並承擔交易風險。")
+
+
+if __name__ == "__main__":
+    main()

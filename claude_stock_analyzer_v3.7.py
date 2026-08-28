@@ -268,16 +268,50 @@ def _trim_incomplete_bar(hist, symbol, now=None):
     return hist, False, None
 
 
+# 同一次批次執行中，各標的最新交易日的最大值。用來偵測「這一檔比同批
+# 其他檔落後一個交易日」這種相對落後——它不會觸發絕對天數門檻，卻是
+# 資料源沒更新的典型徵兆。由 _run_batch() 在批次開始時重置。
+_BATCH_LATEST_DATE = None
+
+
+def _check_batch_lag(price_date):
+    """
+    與同批次其他標的比較，判斷這一檔的資料是不是落後。
+
+    實測證據：00684R.TW 在 2026-08-28 的三次執行中，資料基準日都停在
+    2026-08-26，而同一批的其他標的都是 2026-08-27——落後整整一個交易日。
+    但它只落後 2 個日曆日，低於 _check_price_freshness() 的 4 天門檻，
+    所以絕對天數的檢查抓不到。相對比較才抓得到這種情況。
+
+    回傳 (是否落後, 落後天數, 訊息)。批次中第一檔沒有比較基準，一律回報未落後。
+    """
+    global _BATCH_LATEST_DATE
+    if price_date is None:
+        return False, None, ""
+    if _BATCH_LATEST_DATE is None or price_date > _BATCH_LATEST_DATE:
+        _BATCH_LATEST_DATE = price_date
+        return False, 0, ""
+    lag = (_BATCH_LATEST_DATE - price_date).days
+    if lag <= 0:
+        return False, 0, ""
+    return True, lag, (
+        f"本檔資料基準日 {price_date} 比同批次其他標的的最新日 "
+        f"{_BATCH_LATEST_DATE} 落後 {lag} 天，該檔資料源可能未更新，"
+        f"分析結果請降低採信程度"
+    )
+
+
 def _check_price_freshness(hist, max_lag_days=4, now=None):
     """
     價格資料是否停滯。
 
-    實測證據：00684R.TW 於 2026-08-28 跑了三次（08:10 / 13:24 / 15:10），
-    三次的資料基準日全部停在 2026-08-26、股價全部是 15.25 沒動過，
-    程式沒有任何提示，照樣輸出上漲機率 31.0%、結論「中性偏多」並寫入紀錄。
-    抓不到新資料時應該要說「抓不到」，不能拿兩天前的資料當今天用。
+    這道檢查針對的是「絕對落後」：下市、停牌、代碼變更這類資料源整個
+    斷掉的情況。max_lag_days=4 是為了涵蓋週末（週五收盤 → 週二執行 = 4 天）。
 
-    max_lag_days=4 是為了涵蓋週末（週五收盤 → 週二執行 = 4 天）。
+    ⚠ 它抓不到「只落後一個交易日」的情況。實測證據：00684R.TW 於
+    2026-08-28 跑了三次，資料基準日全部停在 2026-08-26（同批次其他標的
+    都是 2026-08-27），但那只落後 2 個日曆日，低於本門檻。這一類要靠
+    _check_batch_lag() 的相對比較才抓得到——兩道檢查互補，缺一不可。
     """
     now = now or datetime.datetime.now()
     if hist is None or hist.empty:
@@ -1777,7 +1811,7 @@ EXCEL_LOG_COLUMNS = [
     # v3.7 新增：執行情境。沒有這幾欄就無法事後區分「盤中跑的」與「收盤後跑的」，
     # 而兩者的可信度差很多（見 _trim_incomplete_bar 的實測證據）。
     "是否盤中執行", "已剔除未完成K棒", "執行當下價格", "資料落後天數", "資料是否停滯",
-    "跳過原因", "交易日曆提醒",
+    "較同批次落後天數", "是否較同批次落後", "跳過原因", "交易日曆提醒",
     "本益比", "預估本益比", "ROE(%)", "淨利率(%)", "營收成長率YoY(%)", "獲利成長率YoY(%)",
     "殖利率(%)", "殖利率是否異常", "負債權益比", "負債權益比是否異常",
     "產業(Sector)", "細分產業(Industry)", "SOX視為半導體產業週期代理",
@@ -2097,6 +2131,11 @@ def analyze(ticker_symbol):
             if gap_days > 3:
                 print(f"⚠ 資料新鮮度提醒: 籌碼面資料日期({chip_date})與最新股價日期({price_date})"
                       f"相差 {gap_days} 天，籌碼資料可能非最新，解讀時請留意\n")
+
+        # 與同批次其他標的比較是否相對落後（絕對天數門檻抓不到的情況）
+        batch_lagged, batch_lag_days, batch_lag_msg = _check_batch_lag(price_date)
+        if batch_lagged:
+            print(f"⚠ 批次資料落後提醒：{batch_lag_msg}\n")
 
         print("--- 基本面分析 ---")
         for n in fund_notes:
@@ -2449,6 +2488,8 @@ def analyze(ticker_symbol):
             "執行當下價格": live_price,
             "資料落後天數": freshness.get("lag_days"),
             "資料是否停滯": bool(freshness.get("stale")),
+            "較同批次落後天數": batch_lag_days,
+            "是否較同批次落後": bool(batch_lagged),
             "交易日曆提醒": calendar_note or None,
             "本益比": fund_metrics.get("pe"),
             "預估本益比": fund_metrics.get("forward_pe"),
@@ -2597,6 +2638,9 @@ def _run_batch(symbols, pause_sec=1.0):
     v3.6 補強：過濾掉空白/空字串代碼(避免指令列多打一個空格就整個中斷)，
     結尾加上成功/失敗筆數統計。
     """
+    global _BATCH_LATEST_DATE
+    _BATCH_LATEST_DATE = None   # 每次批次重新開始比較基準
+
     clean_symbols = [s.strip() for s in symbols if s and s.strip()]
     if not clean_symbols:
         print("⚠ 沒有有效的股票代碼可供分析。")
