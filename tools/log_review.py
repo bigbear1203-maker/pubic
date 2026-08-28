@@ -435,6 +435,55 @@ def power_note(n: int) -> str:
 # 報告輸出
 # ============================================================
 
+def _explain_no_backfill(df: pd.DataFrame, mode: str) -> None:
+    """
+    沒有任何可回填結果時，說明「為什麼」。
+
+    最常見的原因是「預測的目標日還沒到」——剛開始記錄的頭幾天必然如此，
+    那是正常的，不是錯誤。舊版一律印出「請改用 online 模式」的建議，
+    在這種情況下不但沒幫助，還會讓人以為程式出了問題。
+    """
+    today = dt.date.today()
+    valid = df[df["資料可信"]]
+    targets = valid["目標日"].dropna()
+
+    print("\n【預測驗證】目前還沒有可以驗證的預測。")
+
+    if targets.empty:
+        print("  紀錄中沒有任何有效的預測目標日。")
+        print("  可能是所有紀錄都被標記為 Skipped 或盤中執行，請看上方的資料品質稽核。")
+        return
+
+    future = targets[targets > today]
+    past = targets[targets <= today]
+
+    print(f"  紀錄中共有 {len(targets)} 筆有效預測：")
+    if len(future):
+        nxt = future.min()
+        print(f"    • {len(future)} 筆的預測目標日還沒到（最近的是 {nxt}）")
+    if len(past):
+        print(f"    • {len(past)} 筆的目標日已過，但取不到當日收盤價")
+
+    if len(future) and not len(past):
+        # 這是最常見也最無害的情況：剛開始記錄
+        print(f"\n  ✓ 這是正常的，不是錯誤。今天是 {today}，你剛記錄下的預測要等到")
+        print(f"    {future.min()} 收盤後才會有答案。屆時再執行一次本工具，")
+        print(f"    它就會自動回填實際結果並算出命中率。")
+        print(f"\n  在那之前沒有任何統計數字可看——這正是這套流程的重點：")
+        print(f"  先累積可驗證的紀錄，而不是先看數字。")
+        return
+
+    if len(past):
+        if mode == "offline":
+            print(f"\n  目前是 offline 模式，只能用 log 自己記錄過的收盤價互相對照，")
+            print(f"  也就是說只驗證得了「同一檔在目標日又被跑過一次」的預測。")
+            print(f"  在能連 Yahoo Finance 的環境改用 --mode online，就能取得真實收盤價。")
+        else:
+            print(f"\n  已嘗試線上取價但仍取不到。可能是那幾檔停牌、代碼變更，")
+            print(f"  或目標日其實是非交易日（例如遇到國定假日）。")
+            print(f"  請對照上方的資料品質稽核，或檢查「交易日曆提醒」欄位。")
+
+
 def print_report(df: pd.DataFrame, issues: dict, ev: pd.DataFrame, mode: str) -> None:
     line = "=" * 68
     print(f"\n{line}\n  stock_analysis_log 驗證報告（回填模式：{mode}）\n{line}")
@@ -462,9 +511,7 @@ def print_report(df: pd.DataFrame, issues: dict, ev: pd.DataFrame, mode: str) ->
             print(f"    ...（另有 {len(tbl) - 12} 筆，詳見輸出 Excel）")
 
     if ev.empty:
-        print("\n【預測驗證】無法回填任何實際結果。")
-        print("  offline 模式只能驗證『同一檔在目標日又被跑過一次』的預測；")
-        print("  想要完整驗證，請在能連 Yahoo Finance 的環境用 --mode online。")
+        _explain_no_backfill(df, mode)
         return
 
     print(f"\n【預測驗證】(n={len(ev)})")
@@ -506,7 +553,7 @@ def write_back(log_path: Path, ev: pd.DataFrame) -> int:
     回傳實際寫入的列數。
     """
     if ev.empty or "_原始列號" not in ev.columns:
-        print("  沒有可回填的資料。")
+        print("  目前沒有可回填的資料（多半是預測目標日還沒到，屬正常情形）。")
         return 0
 
     book = pd.read_excel(log_path, sheet_name=SHEET_NAME)

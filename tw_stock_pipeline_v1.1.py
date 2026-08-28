@@ -115,6 +115,14 @@ def _load_module(path: Path, module_name: str):
     return module
 
 
+def next_trading_day_hint(d: datetime.date) -> datetime.date:
+    """粗略推算下一個交易日（只跳週末），純粹用於畫面提示文字。"""
+    nxt = d + datetime.timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += datetime.timedelta(days=1)
+    return nxt
+
+
 def _run_tool(script: Path, args: list[str], label: str) -> bool:
     """以子程序執行工具，失敗不中斷整條流程。"""
     if not script.exists():
@@ -258,15 +266,22 @@ def main():
     print(f"  活躍股篩選結果：{screen_output.name}")
     print(f"  個股分析紀錄：  {log_path.name}")
     print(f"  模擬狀態：      {SIM_STATE.name}")
+    # 用實際解析到的路徑組指令，不要寫死 tools/ 前綴——檔案平放時那會是錯的
+    try:
+        pt_cmd = PAPER_TRADING.relative_to(SCRIPT_DIR)
+    except ValueError:
+        pt_cmd = PAPER_TRADING
     if is_last_day:
         print(f"\n  ★ 今天是模擬結算日，上方已印出完整結算報告。")
         print(f"     若要輸出 Excel 版本：")
-        print(f"       python tools/paper_trading.py report --state {SIM_STATE.name} -o 模擬結算報告.xlsx")
+        print(f"       python {pt_cmd} report -o 模擬結算報告.xlsx")
     else:
         remaining = (SIM_LAST_DAY - today).days
         print(f"\n  距離模擬結算日（{SIM_LAST_DAY}）還有 {remaining} 天。")
         print(f"     隨時查看目前狀況：")
-        print(f"       python tools/paper_trading.py report --state {SIM_STATE.name}")
+        print(f"       python {pt_cmd} report")
+        print(f"\n  提醒：預測的目標日還沒到之前，log_review 沒有實際結果可以回填，")
+        print(f"  那是正常的。等 {next_trading_day_hint(today)} 收盤後再執行，就會開始有命中率統計。")
     print("\n免責聲明：本流程為技術整合與紙上推演，不下真單，")
     print("篩選、分析與模擬結果皆不構成投資建議，請自行判斷並承擔交易風險。")
 
