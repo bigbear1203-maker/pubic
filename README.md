@@ -6,10 +6,12 @@
 
 | 路徑 | 說明 |
 |---|---|
-| `docs/程式診斷報告.md` | 以 80 筆實際紀錄為證的完整診斷：3 個致命問題、4 個結構性問題、6 個次要問題，以及做得好不該改掉的部分 |
+| `claude_stock_analyzer_v3.7.py` | **修正版程式**。診斷出的問題都已套用，可直接取代 v3.6 使用 |
+| `docs/程式診斷報告.md` | 以 80 筆實際紀錄為證的完整診斷：4 個致命問題、4 個結構性問題、6 個次要問題，以及做得好不該改掉的部分 |
+| `docs/v3.7變更說明.md` | v3.6 → v3.7 每一項修改與診斷項目的對照表，以及**刻意沒改**的東西與理由 |
 | `docs/投資策略使用指南.md` | 以投資者角度：現在能／不能拿它做什麼、接下來 6 週該做什麼、沒有優勢時該換什麼題目 |
-| `tools/log_review.py` | **回測驗證工具**。把 `stock_analysis_log.xlsx` 變成「這套系統到底準不準」的量化答案 |
-| `tools/data_quality.py` | **可直接套用的防護模組**。修掉盤中未完成 K 棒、資料停滯、小樣本假準確率等問題 |
+| `tools/log_review.py` | **回測驗證工具**。把 `stock_analysis_log.xlsx` 變成「這套系統到底準不準」的量化答案，並可 `--write-back` 回填實際結果 |
+| `tests/test_v37_offline.py` | v3.7 的離線測試（不需網路），驗證每項修正確實生效 |
 | `samples/` | 診斷所用的實際紀錄檔（2026-08-26 ～ 08-28，80 筆） |
 
 ## 快速開始
@@ -17,14 +19,18 @@
 ```bash
 pip install -r requirements.txt
 
-# 離線驗證（不需網路，用 log 自身價格互相對照）
-python tools/log_review.py samples/stock_analysis_log_20260828.xlsx --mode offline
+# 驗證 v3.7 的修正確實生效（離線，不需網路）
+python tests/test_v37_offline.py
 
-# 線上驗證（需要能連 Yahoo Finance，在你本機執行）
-python tools/log_review.py stock_analysis_log.xlsx --mode online -o report.xlsx
+# 每日流程：收盤後（15:00 之後）分析，然後回填前一日實際結果
+python claude_stock_analyzer_v3.7.py 2330.TW 2408.TW 1303.TW
+python tools/log_review.py stock_analysis_log_v3.7.xlsx --write-back
+
+# 只看診斷、不回填（用附帶的樣本資料）
+python tools/log_review.py samples/stock_analysis_log_20260828.xlsx --mode offline
 ```
 
-## 三個最重要的發現
+## 四個最重要的發現
 
 1. **盤中執行會產生假訊號。** 2891C.TW 在 2026-08-28 的 13:15 算出上漲機率 73.9%，15:01 算出 34.8%——同一個資料基準日，差 39.2 個百分點且方向相反。整份紀錄唯一的 `Sell` 訊號就是這麼來的。
 
@@ -32,12 +38,14 @@ python tools/log_review.py stock_analysis_log.xlsx --mode online -o report.xlsx
 
 3. **80 筆裡 79 筆是 `Wait`。** `model_quality` 零筆合格。這不是門檻設太高，是模型確實沒有可靠優勢——但這個事實被包裝成「等待訊號」而非「目前沒有可交易的優勢」。
 
-詳見 [`docs/程式診斷報告.md`](docs/程式診斷報告.md)。
+4. **「今日」模型有標籤洩漏。** 最終訓練集包含了被預測的那一列本身，等於先看過答案再作答。隔日模型因為 `shift(-1)` 被 `dropna()` 砍掉末列而沒有這個問題——兩者邊界處理原本不一致。
 
-## 建議的修改順序
+詳見 [`docs/程式診斷報告.md`](docs/程式診斷報告.md)，修正對照見 [`docs/v3.7變更說明.md`](docs/v3.7變更說明.md)。
 
-1. **第一階段（1–2 天）**：套用 `trim_incomplete_bar()`，Excel 補上樣本數與回填欄位，開始每天跑 `log_review.py`
-2. **第二階段（4–6 週）**：只在收盤後執行、固定標的池、**不要改參數**，純累積乾淨樣本
+## 接下來的三個階段
+
+1. **第一階段（已完成）**：v3.7 修掉致命問題、補上樣本數與回填欄位
+2. **第二階段（4–6 週，現在開始）**：只在收盤後執行、固定標的池、**不要改參數**，每天 `--write-back` 累積乾淨樣本
 3. **第三階段**：依 Wilson 信賴區間下限決定要不要改模型——若仍 <50%，該換的是題目不是參數
 
 ---

@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-stock_analysis_log.xlsx 回測驗證工具 v1.0
+stock_analysis_log.xlsx 回測驗證工具 v1.1
 ==========================================
+v1.1：支援 claude_stock_analyzer v3.7 新增的欄位。若 log 帶有「是否盤中執行」
+      欄位就直接採用（v3.7 會誠實記錄），沒有的話才退回用執行時刻推斷（v3.6
+      以前的舊紀錄）。新增 --write-back，把實際結果直接回填進 log 檔本身。
 用途：把 claude_stock_analyzer 累積的長期記錄，變成「這套系統到底準不準」
       的量化答案。analyzer 目前只記錄「當下的預測」，從來沒有回填「後來
       實際發生了什麼」，所以無法自我驗證——這支程式補上這一塊。
@@ -21,6 +24,7 @@ stock_analysis_log.xlsx 回測驗證工具 v1.0
     python tools/log_review.py stock_analysis_log.xlsx                 # 自動：能連網就 online
     python tools/log_review.py stock_analysis_log.xlsx --mode offline  # 強制離線
     python tools/log_review.py stock_analysis_log.xlsx -o report.xlsx
+    python tools/log_review.py stock_analysis_log.xlsx --write-back    # 把實際結果回填進 log
 
 重要限制（請務必理解，不要拿小樣本當結論）：
     要證明「準確率 55%」顯著優於「隨機 50%」，在 95% 信心水準下大約需要
@@ -66,6 +70,20 @@ COL_RF_ACC = "隔日_RF_樣本外準確率(%)"
 COL_SCORE = "綜合分數"
 COL_DECISION = "Strategy_Decision"
 COL_QUALITY = "model_quality"
+# v3.7 新增欄位（舊紀錄沒有這些欄位時，程式會自動退回舊的推斷方式）
+COL_INTRADAY_FLAG = "是否盤中執行"
+COL_STALE_FLAG = "資料是否停滯"
+COL_LR_N = "隔日_邏輯迴歸_樣本數"
+COL_RF_N = "隔日_RF_樣本數"
+COL_LR_LB = "隔日_邏輯迴歸_準確率信賴下限(%)"
+COL_RF_LB = "隔日_RF_準確率信賴下限(%)"
+COL_EV_DECISION = "EV_Decision"
+
+# 回填欄位（v3.7 的 EXCEL_LOG_COLUMNS 已預留；舊檔案會由 --write-back 自動補上）
+BACKFILL_COLUMNS = [
+    "實際目標日收盤", "實際報酬(%)", "實際方向",
+    "是否命中_邏輯迴歸", "是否命中_RF", "是否命中_綜合分數", "回填時間",
+]
 
 
 # ============================================================
@@ -83,12 +101,37 @@ def load_log(path: Path) -> pd.DataFrame:
     df["執行日"] = df[COL_TS].dt.date
     df["執行時刻"] = df[COL_TS].dt.time
 
-    df["盤中執行"] = df["執行時刻"].apply(
+    # 盤中與否：v3.7 會誠實記錄「是否盤中執行」，直接採用；舊紀錄沒有這欄，
+    # 才退回用執行時刻推斷（台股 09:00–13:30）。
+    inferred_intraday = df["執行時刻"].apply(
         lambda t: SESSION_OPEN <= t <= SESSION_CLOSE if pd.notna(t) else False
     )
-    df["資料可信"] = df["執行時刻"].apply(
+    if COL_INTRADAY_FLAG in df.columns:
+        flag = df[COL_INTRADAY_FLAG]
+        df["盤中執行"] = flag.where(flag.notna(), inferred_intraday).astype(bool)
+        df["盤中判定來源"] = np.where(flag.notna(), "程式記錄(v3.7)", "執行時刻推斷")
+    else:
+        df["盤中執行"] = inferred_intraday
+        df["盤中判定來源"] = "執行時刻推斷"
+
+    # v3.7 起，盤中執行時已剔除未完成K棒，所以那些紀錄其實是可信的；
+    # 但它們的資料基準日會是前一交易日，去重時仍統一以每個(股票,基準日)
+    # 的最後一筆為準，不需要因為盤中就整筆排除。
+    trimmed_ok = (
+        df.get("已剔除未完成K棒", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+        if "已剔除未完成K棒" in df.columns else pd.Series(False, index=df.index)
+    )
+    by_time = df["執行時刻"].apply(
         lambda t: (t < SESSION_OPEN or t >= POST_CLOSE_SAFE) if pd.notna(t) else False
     )
+    df["資料可信"] = by_time | trimmed_ok
+
+    # 資料停滯或被跳過的紀錄一律不納入統計
+    if COL_STALE_FLAG in df.columns:
+        df.loc[df[COL_STALE_FLAG].fillna(False).astype(bool), "資料可信"] = False
+    if COL_DECISION in df.columns:
+        skipped = df[COL_DECISION].astype(str).str.startswith("Skipped")
+        df.loc[skipped, "資料可信"] = False
     return df
 
 
@@ -218,6 +261,9 @@ def backfill(df: pd.DataFrame, price_map: pd.Series) -> pd.DataFrame:
     每個 (股票, 基準日) 只保留最後一筆「資料可信」的預測，然後回填
     基準日收盤、目標日收盤、實際報酬與命中與否。
     """
+    df = df.copy()
+    if "_原始列號" not in df.columns:
+        df["_原始列號"] = np.arange(len(df))
     valid = df[df["資料可信"]].sort_values(COL_TS)
     dedup = valid.groupby([COL_SYMBOL, "基準日"], as_index=False).last()
 
@@ -242,7 +288,13 @@ def backfill(df: pd.DataFrame, price_map: pd.Series) -> pd.DataFrame:
             "RF樣本外準確率(%)": r.get(COL_RF_ACC),
             "綜合分數": r.get(COL_SCORE),
             "Strategy_Decision": r.get(COL_DECISION),
+            "EV_Decision": r.get(COL_EV_DECISION),
             "model_quality": r.get(COL_QUALITY),
+            "LR樣本數": r.get(COL_LR_N),
+            "RF樣本數": r.get(COL_RF_N),
+            "LR準確率信賴下限(%)": r.get(COL_LR_LB),
+            "RF準確率信賴下限(%)": r.get(COL_RF_LB),
+            "_原始列號": r.get("_原始列號"),
         }
         for key, col in (("LR", COL_LR), ("RF", COL_RF)):
             p = r.get(col)
@@ -299,6 +351,14 @@ def hit_rate_table(ev: pd.DataFrame) -> pd.DataFrame:
     add("邏輯迴歸 (機率≥50%看漲)", ev["LR上漲機率(%)"] >= 50, ev["LR上漲機率(%)"].notna())
     add("Random Forest (機率≥50%看漲)", ev["RF上漲機率(%)"] >= 50, ev["RF上漲機率(%)"].notna())
     add("綜合分數 (>0看漲)", ev["綜合分數"] > 0, ev["綜合分數"].notna())
+    # v3.7 的兩套決策規則實際表現比較：這正是採用影子決策的目的——
+    # 讓資料決定要不要把 Strategy_Decision 換成 EV_Decision。
+    for name, col in (("Strategy_Decision", "Strategy_Decision"),
+                      ("EV_Decision (v3.7影子)", "EV_Decision")):
+        if col in ev.columns:
+            acted = ev[col].isin(["Buy", "Sell"])
+            if acted.any():
+                add(f"{name} 有出手時", ev[col] == "Buy", acted)
     all_true = pd.Series(True, index=ev.index)
     add("笨基準：全部猜漲", all_true, all_true)
     add("笨基準：全部猜跌", ~all_true, all_true)
@@ -434,6 +494,74 @@ def print_report(df: pd.DataFrame, issues: dict, ev: pd.DataFrame, mode: str) ->
     print(f"\n{line}\n免責聲明：本報告是對既有紀錄的統計整理，不構成投資建議。\n{line}\n")
 
 
+def write_back(log_path: Path, ev: pd.DataFrame) -> int:
+    """
+    把實際結果直接回填進 log 檔案本身（v3.7 的 EXCEL_LOG_COLUMNS 已預留這些
+    欄位；舊檔案會自動補上）。
+
+    這是整套流程真正的閉環：analyzer 負責記錄「當時怎麼判斷」，這裡負責補上
+    「後來實際發生什麼」。沒有這一步，跑再多筆紀錄都只是在累積無法驗證的數字。
+
+    只回填空白的欄位，不覆蓋已有的值，所以可以每天重複執行。
+    回傳實際寫入的列數。
+    """
+    if ev.empty or "_原始列號" not in ev.columns:
+        print("  沒有可回填的資料。")
+        return 0
+
+    book = pd.read_excel(log_path, sheet_name=SHEET_NAME)
+    # 以 object dtype 建立/轉換，避免把「漲/跌」這種字串寫進 float 欄位時
+    # 被 pandas 3.0 的 dtype 檢查擋下。
+    for c in BACKFILL_COLUMNS:
+        if c not in book.columns:
+            book[c] = pd.Series([pd.NA] * len(book), dtype="object")
+        else:
+            book[c] = book[c].astype("object")
+
+    # 來源欄位 → log 欄位
+    field_map = {
+        "實際目標日收盤": "目標日收盤",
+        "實際報酬(%)": "實際報酬(%)",
+        "實際方向": "實際方向",
+        "是否命中_邏輯迴歸": "LR命中",
+        "是否命中_RF": "RF命中",
+        "是否命中_綜合分數": "綜合分數命中",
+    }
+
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updates = {c: {} for c in BACKFILL_COLUMNS}
+    written = 0
+    already = book["實際報酬(%)"].notna()
+
+    for _, r in ev.iterrows():
+        pos = r.get("_原始列號")
+        if pd.isna(pos):
+            continue
+        pos = int(pos)
+        if pos >= len(book) or already.iloc[pos]:
+            continue  # 超出範圍，或已回填過（不覆蓋既有值）
+        for log_col, src_col in field_map.items():
+            val = r.get(src_col)
+            updates[log_col][pos] = None if pd.isna(val) else val
+        updates["回填時間"][pos] = now
+        written += 1
+
+    if written:
+        for col, mapping in updates.items():
+            if not mapping:
+                continue
+            series = book[col].copy()
+            for pos, val in mapping.items():
+                series.iat[pos] = val
+            book[col] = series
+        with pd.ExcelWriter(log_path, engine="openpyxl", mode="w") as w:
+            book.to_excel(w, sheet_name=SHEET_NAME, index=False)
+        print(f"  ✓ 已回填 {written} 列實際結果至 {log_path}")
+    else:
+        print("  沒有需要回填的列（可能都已回填過，或尚無可驗證的實際結果）。")
+    return written
+
+
 def write_excel(path: Path, df, issues, ev) -> None:
     with pd.ExcelWriter(path, engine="openpyxl") as w:
         if not ev.empty:
@@ -461,6 +589,8 @@ def main(argv=None) -> int:
     ap.add_argument("--mode", choices=["auto", "online", "offline"], default="auto",
                     help="回填實際收盤價的方式（預設 auto：先試 online，失敗退回 offline）")
     ap.add_argument("-o", "--output", type=Path, default=None, help="輸出 Excel 報告路徑")
+    ap.add_argument("--write-back", action="store_true",
+                    help="把實際結果回填進 log 檔案本身（只補空白欄位，不覆蓋既有值）")
     args = ap.parse_args(argv)
 
     if not args.log.exists():
@@ -492,6 +622,13 @@ def main(argv=None) -> int:
 
     ev = backfill(df, price_map)
     print_report(df, issues, ev, used_mode)
+
+    if args.write_back:
+        print("\n[回填] 寫回 log 檔案...")
+        try:
+            write_back(args.log, ev)
+        except PermissionError:
+            print(f"  ⚠ 無法寫入 {args.log}（檔案可能正在 Excel 中開啟，請先關閉再執行）")
 
     out = args.output or args.log.with_name(
         f"log_review_{dt.date.today().isoformat()}.xlsx"
