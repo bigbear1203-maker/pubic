@@ -1,13 +1,6 @@
 @echo off
 chcp 65001 >nul
-rem ------------------------------------------------------------
-rem  %~dp0 = 這個批次檔自己所在的資料夾。
-rem  先切過去再執行，所以不論你從哪裡點兩下、或在哪個路徑呼叫，
-rem  都不會再出現 "can not open file ... stock.py" 這種錯誤。
-rem ------------------------------------------------------------
+rem  cd to this batch file own folder (%~dp0) so the path is always right.
+rem  This is why you can double-click it from anywhere without errors.
 cd /d "%~dp0"
 python stock.py %*
-if errorlevel 1 (
-  echo.
-  echo [執行結束，上方若有錯誤請往回看]
-)
