@@ -1912,11 +1912,27 @@ def _append_to_excel_log(record, path=None):
             wb = load_workbook(path)
             ws = wb.active
             existing_header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))] if ws.max_row >= 1 else []
-            if existing_header != EXCEL_LOG_COLUMNS:
+            # 去掉尾端的空白欄位再比較。曾經發生過的情況：舊版寫的表頭只有
+            # 101 欄，新版 append 了 103 個值把工作表撐寬，於是表頭尾端多出
+            # 兩個空欄。若不先去除，之後每次比較都會因為長度不同而不斷另存
+            # 新檔；更糟的是，那兩欄空表頭代表資料早已錯位——從差異點開始，
+            # 每一欄的值都對到了錯誤的名稱上，而且不會噴任何錯誤。
+            while existing_header and existing_header[-1] in (None, ""):
+                existing_header.pop()
+
+            # 額外的寬度防線：即使表頭名稱看起來相同，只要工作表實際寬度
+            # 與欄位數不符，就代表這個檔案已經被寫壞過，不能再往裡面 append。
+            width_mismatch = (ws.max_row >= 1 and ws.max_column > len(EXCEL_LOG_COLUMNS))
+            if existing_header != EXCEL_LOG_COLUMNS or width_mismatch:
                 fallback_path = path.replace(".xlsx", f"_v{VERSION}.xlsx")
-                print(f"  ⚠ 既有 Excel 紀錄檔（{path}）欄位與目前版本(v{VERSION})不一致，"
-                      f"可能是舊版本程式建立的檔案。為避免破壞既有資料，"
-                      f"本次改寫入新檔案: {fallback_path}（請自行決定是否手動合併兩份檔案）")
+                why = ("工作表實際寬度為 %d 欄、超過目前版本的 %d 欄，該檔案先前已被"
+                       "混版寫入而錯位" % (ws.max_column, len(EXCEL_LOG_COLUMNS))
+                       ) if width_mismatch else "欄位名稱與目前版本不一致，可能是舊版本程式建立的檔案"
+                print(f"  ⚠ 既有 Excel 紀錄檔（{path}）{why}。為避免破壞既有資料，"
+                      f"本次改寫入新檔案: {fallback_path}")
+                if width_mismatch:
+                    print(f"     舊檔的欄位已經錯位，統計前請先用 tools/repair_log.py 修復：")
+                    print(f"       python repair_log.py \"{path}\" --dedup")
                 path = fallback_path
                 if os.path.exists(path):
                     wb = load_workbook(path)
