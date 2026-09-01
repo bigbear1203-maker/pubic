@@ -1832,6 +1832,8 @@ EXCEL_LOG_COLUMNS = [
     "隔日_RF_勝率(%)", "隔日_RF_平均獲利(%)", "隔日_RF_平均虧損(%)", "隔日_RF_期望值EV(%)",
     "隔日_RF_近30日滾動準確率(%)", "隔日_RF_衰退警報", "隔日_RF_特徵重要性Top5",
     "隔日_RF_樣本數", "隔日_RF_準確率信賴下限(%)",
+    # v3.7 追加：一句話的操作建議與對應價位，放在決策欄位旁邊方便對照
+    "操作建議", "建議買進價", "建議理由",
     "Strategy_Decision", "Strategy_Decision_信心(%)", "model_quality",
     # v3.7 新增：EV 影子決策，與現行規則並行記錄供日後比較
     "EV_Decision", "EV_採用模型", "EV_淨期望值(%)", "EV_來回成本(%)", "EV_原因",
@@ -1993,6 +1995,8 @@ def _append_skip_record(ticker_symbol, decision, reason, full_output=""):
     record = {
         "執行時間": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "股票代碼": ticker_symbol,
+        "操作建議": "不分析",
+        "建議理由": f"資料未通過品質把關：{reason}",
         "Strategy_Decision": decision,
         "跳過原因": reason,
         "model_quality": "unknown",
@@ -2053,6 +2057,128 @@ def compute_risk_reward(current_price, atr, decision, atr_multiplier=1.5, reward
     reward = abs(target - current_price)
     rr_ratio = reward / risk if risk > 0 else None
     return {"stop_loss": stop, "target": target, "risk_reward_ratio": rr_ratio}
+
+
+# ----------------------------
+# 操作建議（v3.7 追加）
+# ----------------------------
+#
+# 把散落在各欄位的數字，收斂成一句「要不要買、多少錢買、多少錢賣」。
+#
+# ⚠ 這一段的設計原則，請先讀完再用：
+#
+# 1. 「買不買」由模型品質關卡決定，不由機率大小決定。
+#    當 model_quality 不是 usable_with_caution 時，代表這個模型的準確率
+#    連信賴區間下限都沒超過 50%——此時再漂亮的機率數字也只是雜訊，
+#    一律輸出「不建議進場」。這不是保守，是誠實：沒有優勢就是沒有優勢。
+#
+# 2. 「多少錢」不使用方向模型，只使用系統裡真正可靠的兩個量：
+#      • ATR(14 日 Wilder)：波動幅度的穩健估計
+#      • 日報酬標準差：backtest_confidence() 已驗證過區間覆蓋率
+#    這兩個量描述的是「這檔股票會晃多大」，跟「會往哪邊走」無關，
+#    所以即使方向模型不可靠，這些價位仍然有風險控管上的意義。
+#
+# 3. 因此，當建議是「不建議進場」時，價位欄位仍會填——那是給你
+#    「如果你基於自己的判斷決定要買」時的風控參考，不是買進訊號。
+#
+# 價位怎麼算：
+#    建議買進價 = 現價 − 0.5×ATR      （掛限價等小回檔，不追高）
+#    建議停損價 = 買進價 − 1.5×ATR
+#    建議目標價 = 買進價 × (1 + 日波動度 × √5)
+#                 持有 5 個交易日、約 1 個標準差的移動幅度。
+#                 波動度隨時間以 √t 放大，這是標準做法。
+#    風險報酬比 = (目標−買進) / (買進−停損)
+#
+# 為什麼目標價不沿用 compute_risk_reward() 的 2×ATR：那個公式的停損與
+# 目標都是 ATR 的固定倍數，算出來的風報比恆為 2/1.5 = 1.33，每一檔都
+# 一樣，完全沒有資訊量。改用波動度推估的目標價之後，風報比會隨個股
+# 波動結構變化，才看得出哪一檔的賠率結構比較好。
+
+ACTION_HOLD_DAYS = 5          # 目標價的假設持有期（交易日）
+ACTION_ENTRY_PULLBACK_ATR = 0.5   # 買進價 = 現價 − 這個倍數 × ATR
+ACTION_STOP_ATR = 1.5             # 停損 = 買進價 − 這個倍數 × ATR
+ACTION_MIN_RR = 1.5               # 風報比低於此值視為賠率不划算
+
+
+def build_action_advice(price, atr, daily_std_pct, model_quality,
+                        strategy_decision, total_score, skip_reason=None,
+                        fee_discount=FEE_DISCOUNT):
+    """
+    產生「操作建議」與對應價位。回傳 dict，欄位名稱與 Excel 一致。
+
+    所有輸出都是規則式推導，不含任何預測成分。價位以「建議買進價」為
+    基準計算；若你已經持有，請改用自己的實際成本價套同一組倍數，
+    因為停損的意義是「相對你的成本虧多少」，不是相對現價。
+    """
+    out = {
+        "操作建議": None, "建議買進價": None, "建議停損價": None,
+        "建議目標價": None, "Risk_Reward_Ratio": None, "建議理由": None,
+    }
+
+    if skip_reason:
+        out["操作建議"] = "不分析"
+        out["建議理由"] = f"資料未通過品質把關：{skip_reason}"
+        return out
+
+    if price is None or pd.isna(price):
+        out["操作建議"] = "不分析"
+        out["建議理由"] = "沒有有效的股價"
+        return out
+
+    price = float(price)
+
+    # ---- 價位：只用波動度，與方向無關 ----
+    if atr is not None and not pd.isna(atr) and float(atr) > 0:
+        atr = float(atr)
+        entry = price - ACTION_ENTRY_PULLBACK_ATR * atr
+        stop = entry - ACTION_STOP_ATR * atr
+        if daily_std_pct is not None and not pd.isna(daily_std_pct) and float(daily_std_pct) > 0:
+            sigma = float(daily_std_pct) / 100.0 * np.sqrt(ACTION_HOLD_DAYS)
+            target = entry * (1 + sigma)
+        else:
+            target = entry + 2.0 * atr      # 沒有波動度資料時的退路
+        risk, reward = entry - stop, target - entry
+        rr = reward / risk if risk > 0 else None
+        out.update({"建議買進價": entry, "建議停損價": stop,
+                    "建議目標價": target, "Risk_Reward_Ratio": rr})
+        cost = round_trip_cost_pct()
+        net_gain_pct = (target / entry - 1) * 100 - cost
+    else:
+        rr, net_gain_pct = None, None
+
+    # ---- 決策：由模型品質關卡決定，不由機率大小決定 ----
+    reasons = []
+    if model_quality != "usable_with_caution":
+        label = {"not_reliable": "模型準確率的信賴區間下限未超過 50%，與隨機無異",
+                 "weak": "模型準確率點估計尚可，但信賴區間仍蓋住 50%",
+                 "unknown": "資料不足，無法評估模型可靠度"}.get(
+                     model_quality, f"模型品質為 {model_quality}")
+        out["操作建議"] = "不建議進場"
+        reasons.append(label)
+        reasons.append("下方價位僅供你自行判斷要進場時的風控參考，不是買進訊號")
+    elif strategy_decision == "Buy":
+        out["操作建議"] = f"可考慮買進（限價 {out['建議買進價']:.2f} 以下）"
+        reasons.append("雙模型同向、信心達標，且模型品質通過關卡")
+    elif strategy_decision == "Sell":
+        out["操作建議"] = "若持有，建議出場"
+        reasons.append("模型判斷偏空；現股無法放空，此建議只對已持有者有意義")
+    else:
+        out["操作建議"] = "觀望"
+        reasons.append("模型品質通過，但本次訊號不足以形成明確方向")
+
+    # ---- 附加提醒 ----
+    if rr is not None and rr < ACTION_MIN_RR:
+        reasons.append(f"風報比僅 {rr:.2f}，低於 {ACTION_MIN_RR}，賠率結構不划算")
+    if net_gain_pct is not None and net_gain_pct <= 0:
+        reasons.append(f"目標價扣掉 {round_trip_cost_pct():.2f}% 來回成本後不賺錢")
+    if total_score is not None and not pd.isna(total_score):
+        if total_score >= 4:
+            reasons.append(f"三面向綜合分數 {int(total_score)}（偏多），但那是規則式描述，不是勝率")
+        elif total_score <= -4:
+            reasons.append(f"三面向綜合分數 {int(total_score)}（偏空）")
+
+    out["建議理由"] = "；".join(reasons)
+    return out
 
 
 # ----------------------------
@@ -2470,6 +2596,32 @@ def analyze(ticker_symbol):
         print("     或模型整體準確率未達品質門檻，刻意不勉強輸出方向；")
         print("     「不交易」本身也是一種合理的策略選擇。")
 
+        # ---- 操作建議（v3.7 追加）----
+        advice = build_action_advice(
+            price=current_price,
+            atr=rng["atr"] if rng is not None else None,
+            daily_std_pct=rng["daily_std_pct"] if rng is not None else None,
+            model_quality=model_quality,
+            strategy_decision=strategy_decision,
+            total_score=total,
+        )
+        print(f"\n--- 操作建議 ---")
+        print(f"  ► {advice['操作建議']}")
+        if advice["建議買進價"] is not None:
+            print(f"  建議買進價: {advice['建議買進價']:.2f} {currency}"
+                  f"（現價 {current_price:.2f} − 0.5×ATR，掛限價等回檔，不追高）")
+            print(f"  建議停損價: {advice['建議停損價']:.2f} {currency}"
+                  f"（買進價 − 1.5×ATR，跌破就走）")
+            print(f"  建議目標價: {advice['建議目標價']:.2f} {currency}"
+                  f"（持有約 {ACTION_HOLD_DAYS} 個交易日、1 個標準差的移動幅度）")
+            if advice["Risk_Reward_Ratio"] is not None:
+                print(f"  風險報酬比: {advice['Risk_Reward_Ratio']:.2f}"
+                      f"（賺賠比，一般認為要 ≥ {ACTION_MIN_RR} 才值得下注）")
+        print(f"  理由: {advice['建議理由']}")
+        print(f"  ※ 價位以「建議買進價」為基準。若你已經持有，請改用自己的實際")
+        print(f"     成本價套同一組倍數——停損的意義是相對你的成本虧多少，")
+        print(f"     不是相對現價。")
+
         print("\n--- 方法論限制 ---")
         print("  • 基本面比率主要來自 yfinance 資料快照；嚴格估值仍應使用同業/自身歷史分位數。")
         print("  • 技術分數是規則式描述，不代表上漲機率；尚未用 OOS 資料校準成勝率。")
@@ -2600,10 +2752,16 @@ def analyze(ticker_symbol):
         record["EV_淨期望值(%)"] = ev_detail.get("ev_pct")
         record["EV_來回成本(%)"] = ev_detail.get("cost_pct")
         record["EV_原因"] = ev_detail.get("reason")
-        if rr is not None:
-            record["Risk_Reward_Ratio"] = rr["risk_reward_ratio"]
-            record["建議停損價"] = rr["stop_loss"]
-            record["建議目標價"] = rr["target"]
+        # 操作建議的價位一律填寫（即使建議是「不建議進場」，那些價位仍是
+        # 風控參考）。這取代了舊的 compute_risk_reward 輸出——舊版只在
+        # Buy/Sell 時才有值，而 Buy/Sell 幾乎不會出現，所以那三個欄位
+        # 在實際紀錄裡永遠是空的。
+        record["操作建議"] = advice["操作建議"]
+        record["建議買進價"] = advice["建議買進價"]
+        record["建議理由"] = advice["建議理由"]
+        record["建議停損價"] = advice["建議停損價"]
+        record["建議目標價"] = advice["建議目標價"]
+        record["Risk_Reward_Ratio"] = advice["Risk_Reward_Ratio"]
         if chip_metrics.get("net_streak_days") is not None:
             record["三大法人連續同方向天數"] = chip_metrics["net_streak_days"]
             record["三大法人連續方向"] = chip_metrics.get("net_streak_direction")
