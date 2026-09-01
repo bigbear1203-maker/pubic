@@ -84,10 +84,49 @@ import pandas as pd
 
 DEFAULT_STATE = Path("paper_trading_state.json")
 
+
+
+# ----------------------------
+# 共用設定檔（v3.7 追加）
+# ----------------------------
+#
+# 成本參數原本在 analyzer 與 paper_trading 各定義一次。改券商折扣時
+# 只改一邊，就會出現「操作建議算的成本」與「模擬扣的成本」不一致，
+# 而且不會報任何錯。改由 stock_settings.json 統一提供，找不到檔案時
+# 沿用下方的內建預設值，不影響單獨執行。
+
+def _load_shared_settings():
+    """讀取同目錄（或上層）的 stock_settings.json。找不到就回傳空 dict。"""
+    import json
+    from pathlib import Path
+    here = Path(__file__).resolve().parent
+    for base in (here, here.parent, here / "tools"):
+        p = base / "stock_settings.json"
+        if p.exists():
+            try:
+                with open(p, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"  ⚠ stock_settings.json 讀取失敗，改用內建預設值：{type(e).__name__}: {e}")
+                return {}
+    return {}
+
+
+_SETTINGS = _load_shared_settings()
+
+
+def _setting(section: str, key: str, default):
+    try:
+        v = _SETTINGS[section][key]
+        return type(default)(v) if v is not None else default
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
 FEE_RATE = 0.001425
-FEE_DISCOUNT = 0.6      # 券商手續費折扣，請依你實際使用的券商調整
+FEE_DISCOUNT = _setting("券商與稅費", "fee_discount", 0.6)
 FEE_MIN = 20.0          # 單筆最低手續費
-TAX_SELL = 0.003        # 賣出證券交易稅
+TAX_SELL = _setting("券商與稅費", "securities_tax_pct", 0.3) / 100.0
 SHARES_PER_LOT = 1000
 
 STRATEGIES = ("strategy_decision", "ev_decision", "score_topn",

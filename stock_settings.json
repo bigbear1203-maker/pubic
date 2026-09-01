@@ -1,0 +1,36 @@
+{
+  "_說明": "所有工具共用的設定。改這裡就好，不要再去改各支程式裡的常數。",
+  "_使用方式": "把這個檔案放在與各程式同一個資料夾。找不到時各程式會用自己的內建預設值，不會出錯。",
+
+  "券商與稅費": {
+    "_註": "fee_discount 請填你券商的實際折扣，6折填 0.6、28折填 0.28",
+    "fee_discount": 0.6,
+    "securities_tax_pct": 0.3,
+    "_securities_tax_pct_註": "現股賣出證交稅 0.3%；若你做當沖改成 0.15"
+  },
+
+  "篩選與分析": {
+    "top_n_active": 10,
+    "_top_n_active_註": "每天進入完整分析的活躍股檔數，建議 5~10",
+    "analyzer_pause_sec": 1.5
+  },
+
+  "操作建議價位": {
+    "_註": "這幾個倍數只用 ATR 與波動度推算，與方向模型無關",
+    "hold_days": 5,
+    "entry_pullback_atr": 0.5,
+    "stop_atr": 1.5,
+    "min_risk_reward": 1.5
+  },
+
+  "紙上交易模擬": {
+    "capital": 1000000,
+    "top_n": 5,
+    "max_position_pct": 0.25,
+    "stop_loss_pct": 0.07,
+    "stop_loss_atr": 2.0,
+    "max_holding_days": 10,
+    "allow_odd_lot": true,
+    "_allow_odd_lot_註": "允許零股。設為 false 則只買整張，但 100 萬買不起一張台積電"
+  }
+}

@@ -114,18 +114,62 @@ def diagnose(info: dict, schema: list[str]) -> bool:
     return True
 
 
+# 歷史欄位結構。新版若在「中間」插入欄位，舊資料就不能靠尾端補空來對齊——
+# 那樣會讓插入點之後的每一欄再次錯位（本工具原本就踩過這個坑）。這裡用
+# 「欄位寬度 → 當時的欄位清單」反推舊資料的真實結構，再依欄位名稱對映到
+# 目前的結構，缺的補空、多的丟棄。
+#
+# 由目前結構往回推導，不需手動維護整份清單：
+#   106 欄：目前（新增 操作建議／建議買進價／建議理由）
+#   103 欄：新增 較同批次落後天數／是否較同批次落後 之後
+#   101 欄：v3.7 初版
+COLUMNS_ADDED_LATER = [
+    ["操作建議", "建議買進價", "建議理由"],          # 106 → 103
+    ["較同批次落後天數", "是否較同批次落後"],          # 103 → 101
+]
+
+
+def historical_schemas(current: list[str]) -> dict:
+    """回傳 {欄位寬度: 該版本的欄位清單}，含目前版本與所有已知舊版。"""
+    out = {len(current): list(current)}
+    cols = list(current)
+    for removed in COLUMNS_ADDED_LATER:
+        cols = [c for c in cols if c not in removed]
+        out.setdefault(len(cols), list(cols))
+    return out
+
+
 def repair(path: Path, info: dict, schema: list[str], dedup: bool) -> None:
     w = len(schema)
-    fixed = []
+    known = historical_schemas(schema)
     dropped = 0
+
+    widths = sorted(info["data_widths"])
+    data_width = widths[-1] if widths else w
+    source_schema = known.get(data_width)
+    if source_schema is None:
+        print(f"\n  ⚠ 資料寬度 {data_width} 不符合任何已知版本"
+              f"（已知：{sorted(known)}），改用尾端截斷/補空處理。")
+        print(f"     若修復後仍有欄位看起來錯位，請把檔案傳出來判斷。")
+        source_schema = schema
+    elif data_width != w:
+        missing = [c for c in schema if c not in source_schema]
+        print(f"\n  資料是 {data_width} 欄版本寫的，目前結構是 {w} 欄。")
+        print(f"  依欄位名稱對映，新增的欄位留空：{missing}")
+
+    fixed = []
     for r in info["data"]:
-        if len(r) > w:
-            r = r[:w]           # 多出來的是沒有表頭的殘留欄位
-        elif len(r) < w:
-            r = list(r) + [None] * (w - len(r))
+        r = list(r)
+        if len(r) > len(source_schema):
+            r = r[:len(source_schema)]
+        elif len(r) < len(source_schema):
+            r = r + [None] * (len(source_schema) - len(r))
         fixed.append(r)
 
-    df = pd.DataFrame(fixed, columns=schema)
+    # 先用「資料當時的結構」建表，再依欄位名稱對映到目前結構。
+    # 這一步是關鍵：中間插入的新欄位會被放到正確位置並留空，
+    # 而不是把舊資料整段往後推。
+    df = pd.DataFrame(fixed, columns=source_schema).reindex(columns=schema)
 
     if dedup:
         before = len(df)

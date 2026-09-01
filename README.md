@@ -6,6 +6,9 @@
 
 | 路徑 | 說明 |
 |---|---|
+| `stock.py` | **統一入口**。`daily` / `report` / `check` / `repair` … 一支程式取代 10 個進入點 |
+| `stock_settings.json` | **共用設定**。券商折扣、模擬參數集中在這裡，改一處全部同步 |
+| `docs/操作總覽.md` | 一張表看完所有指令、檔案結構與換版流程 |
 | `claude_stock_analyzer_v3.7.py` | **修正版程式**。診斷出的問題都已套用，可直接取代 v3.6 使用 |
 | `tw_active_stocks_predictor_v3.1.py` | 活躍股篩選修正版：補上 v2.1/v3.0 共同的「永遠不抓今天」、ETF 4 碼漏洞（0050/0056）、關鍵字誤殺 |
 | `tw_stock_pipeline_v1.1.py` | 整合流程：活躍股篩選 → 完整分析 → 紙上交易模擬 → 結果回填，每天一支指令跑完 |
@@ -25,6 +28,11 @@
 
 ```bash
 pip install -r requirements.txt
+
+# 統一入口（推薦）
+python stock.py            # 列出所有指令與目前狀態
+python stock.py check      # 環境自檢
+python stock.py daily      # 每個交易日收盤後跑這個
 
 # 驗證 v3.7 的修正確實生效（離線，不需網路）
 python tests/test_v37_offline.py

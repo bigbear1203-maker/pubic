@@ -207,9 +207,48 @@ TW_SESSION_CLOSE = datetime.time(13, 30)
 # 收盤後緩衝：資料源更新需要時間，太早抓仍可能拿到未定案的收盤價
 TW_DATA_SETTLE = datetime.time(14, 0)
 
+
+
+# ----------------------------
+# 共用設定檔（v3.7 追加）
+# ----------------------------
+#
+# 成本參數原本在 analyzer 與 paper_trading 各定義一次。改券商折扣時
+# 只改一邊，就會出現「操作建議算的成本」與「模擬扣的成本」不一致，
+# 而且不會報任何錯。改由 stock_settings.json 統一提供，找不到檔案時
+# 沿用下方的內建預設值，不影響單獨執行。
+
+def _load_shared_settings():
+    """讀取同目錄（或上層）的 stock_settings.json。找不到就回傳空 dict。"""
+    import json
+    from pathlib import Path
+    here = Path(__file__).resolve().parent
+    for base in (here, here.parent, here / "tools"):
+        p = base / "stock_settings.json"
+        if p.exists():
+            try:
+                with open(p, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"  ⚠ stock_settings.json 讀取失敗，改用內建預設值：{type(e).__name__}: {e}")
+                return {}
+    return {}
+
+
+_SETTINGS = _load_shared_settings()
+
+
+def _setting(section: str, key: str, default):
+    try:
+        v = _SETTINGS[section][key]
+        return type(default)(v) if v is not None else default
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
 # 台股來回交易成本：手續費 0.1425% × 折扣 × 買賣兩次 + 賣出證交稅 0.3%
-FEE_DISCOUNT = 0.6          # 券商手續費折扣，請依你實際使用的券商調整
-SECURITIES_TAX_PCT = 0.3    # 現股賣出證交稅；當沖減半請改 0.15
+FEE_DISCOUNT = _setting("券商與稅費", "fee_discount", 0.6)
+SECURITIES_TAX_PCT = _setting("券商與稅費", "securities_tax_pct", 0.3)
 
 
 def round_trip_cost_pct(fee_discount=FEE_DISCOUNT, tax_pct=SECURITIES_TAX_PCT):
@@ -2094,10 +2133,10 @@ def compute_risk_reward(current_price, atr, decision, atr_multiplier=1.5, reward
 # 一樣，完全沒有資訊量。改用波動度推估的目標價之後，風報比會隨個股
 # 波動結構變化，才看得出哪一檔的賠率結構比較好。
 
-ACTION_HOLD_DAYS = 5          # 目標價的假設持有期（交易日）
-ACTION_ENTRY_PULLBACK_ATR = 0.5   # 買進價 = 現價 − 這個倍數 × ATR
-ACTION_STOP_ATR = 1.5             # 停損 = 買進價 − 這個倍數 × ATR
-ACTION_MIN_RR = 1.5               # 風報比低於此值視為賠率不划算
+ACTION_HOLD_DAYS = _setting("操作建議價位", "hold_days", 5)
+ACTION_ENTRY_PULLBACK_ATR = _setting("操作建議價位", "entry_pullback_atr", 0.5)
+ACTION_STOP_ATR = _setting("操作建議價位", "stop_atr", 1.5)
+ACTION_MIN_RR = _setting("操作建議價位", "min_risk_reward", 1.5)
 
 
 def build_action_advice(price, atr, daily_std_pct, model_quality,
