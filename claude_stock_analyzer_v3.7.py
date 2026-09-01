@@ -2688,9 +2688,14 @@ def analyze(ticker_symbol):
             "預測目標日(隔日估計)": str(target_date),
             "目前股價": current_price,
             "幣別": currency,
-            # v3.7 新增：執行情境。事後統計時務必只採用「是否盤中執行=False」
-            # 的紀錄——盤中跑的那些不可信（見 _trim_incomplete_bar 的實測證據）。
-            "是否盤中執行": bool(bar_trimmed),
+            # 執行情境。這兩欄看似相近，實際上問的是不同的事，不要合併：
+            #   是否盤中執行   ── 執行當下是不是在台股交易時段（09:00~14:00）
+            #   已剔除未完成K棒 ── 這次「實際上」有沒有砍掉一根未收盤的K棒
+            # 兩者會不一致的典型情況：09:10 執行時，yfinance 還沒回傳今天的
+            # K棒，此時是盤中執行(True)但沒有東西可剔除(False)，資料其實是
+            # 乾淨的。先前兩欄都寫 bool(bar_trimmed)，等於同一個值存兩次，
+            # 白白丟掉了「盤中跑但資料乾淨」這個可以放心採用的情境。
+            "是否盤中執行": bool(is_intraday_now(ticker_symbol)),
             "已剔除未完成K棒": bool(bar_trimmed),
             "執行當下價格": live_price,
             "資料落後天數": freshness.get("lag_days"),

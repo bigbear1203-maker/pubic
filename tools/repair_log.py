@@ -93,11 +93,29 @@ def diagnose(info: dict, schema: list[str]) -> bool:
     print(f"       資料列欄位數：{sorted(info['data_widths'])}")
     print(f"       正確欄位數：{info['schema_width']}")
 
-    if info["aligned"] and info["data_widths"] <= {info["schema_width"]}:
+    # 表頭對、寬度也對，不代表資料沒錯位。混版 append 的檔案讀出來
+    # 每一列都會被補齊到相同寬度，光看寬度看不出問題——必須檢查內容。
+    bad_rows = []
+    for i, r in enumerate(info["data"]):
+        rr = list(r)[:info["schema_width"]]
+        rr += [None] * (info["schema_width"] - len(rr))
+        if _row_score(rr, schema) < 4:
+            bad_rows.append(i + 2)      # +2：Excel 列號從 1 起算且第 1 列是表頭
+
+    if info["aligned"] and info["data_widths"] <= {info["schema_width"]} and not bad_rows:
         print("\n✓ 表頭與資料一致，不需要修復。")
         return False
 
     print("\n✗ 偵測到錯位：")
+    if bad_rows:
+        print(f"    有 {len(bad_rows)} 列的內容與欄位名稱對不上"
+              f"（Excel 列號：{bad_rows[:12]}{' …' if len(bad_rows) > 12 else ''}）")
+        sample = list(info["data"][bad_rows[0] - 2])
+        idx = schema.index("程式版本")
+        if idx < len(sample):
+            print(f"    例如第 {bad_rows[0]} 列的「程式版本」欄位是 {sample[idx]!r}，"
+                  f"但那應該是版本號 3.7")
+        print(f"    成因：升版之後繼續往舊檔 append，新舊版本的資料列混在同一個檔案。")
     if not info["aligned"]:
         for i, (h, s) in enumerate(zip(info["trimmed_header"], schema)):
             if h != s:
@@ -139,37 +157,94 @@ def historical_schemas(current: list[str]) -> dict:
     return out
 
 
+# 用來辨識「這一列是哪個版本寫的」的特徵欄位。
+# 不能只看寬度：openpyxl 讀取時會把所有列補齊到工作表的最大寬度，
+# 舊版列（值較少）與新版列（值較多）讀出來一樣寬，光看寬度分不出來。
+# 而同一個檔案裡混著兩種版本的列，是升版後繼續 append 舊檔的必然結果。
+def _row_score(row: list, cols: list[str]) -> int:
+    """把一列套上某個欄位結構，檢查幾個特徵欄位是否合理。分數越高越可能是對的。"""
+    idx = {c: i for i, c in enumerate(cols)}
+
+    def val(name):
+        i = idx.get(name)
+        return row[i] if i is not None and i < len(row) else None
+
+    score = 0
+    v = val("程式版本")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and 1 <= float(v) <= 20:
+        score += 3                      # 版本號一定是 3.x，最強的特徵
+    elif v is None:
+        score += 0
+    else:
+        score -= 3                      # 是字串就一定錯位了
+
+    v = val("model_quality")
+    if v in (None, "not_reliable", "weak", "usable_with_caution", "unknown"):
+        score += 2
+    else:
+        score -= 2
+
+    v = val("三大法人連續方向")
+    if v in (None, "買超", "賣超"):
+        score += 1
+    else:
+        score -= 1
+
+    v = val("實際方向")
+    if v in (None, "漲", "跌", "平"):
+        score += 1
+    else:
+        score -= 1
+
+    v = val("綜合結論")
+    if v is None or isinstance(v, str):
+        score += 1
+    else:
+        score -= 1
+    return score
+
+
 def repair(path: Path, info: dict, schema: list[str], dedup: bool) -> None:
     w = len(schema)
     known = historical_schemas(schema)
     dropped = 0
 
-    widths = sorted(info["data_widths"])
-    data_width = widths[-1] if widths else w
-    source_schema = known.get(data_width)
-    if source_schema is None:
-        print(f"\n  ⚠ 資料寬度 {data_width} 不符合任何已知版本"
-              f"（已知：{sorted(known)}），改用尾端截斷/補空處理。")
-        print(f"     若修復後仍有欄位看起來錯位，請把檔案傳出來判斷。")
-        source_schema = schema
-    elif data_width != w:
-        missing = [c for c in schema if c not in source_schema]
-        print(f"\n  資料是 {data_width} 欄版本寫的，目前結構是 {w} 欄。")
-        print(f"  依欄位名稱對映，新增的欄位留空：{missing}")
-
+    # 逐列判斷版本。同一個檔案完全可能同時存在多種版本的列——
+    # 升版之後繼續往舊檔 append 就會這樣，而且不會有任何錯誤訊息。
+    # 使用者實際遇到的症狀是「程式版本」欄位出現 [3.7, '漲', '跌']：
+    # 3.7 是新版列，'漲'/'跌' 是舊版列錯位 3 欄後跑進來的「實際方向」。
+    candidates = [known[k] for k in sorted(known, reverse=True)]
+    rows_by_schema: dict[int, int] = {}
     fixed = []
+
     for r in info["data"]:
         r = list(r)
-        if len(r) > len(source_schema):
-            r = r[:len(source_schema)]
-        elif len(r) < len(source_schema):
-            r = r + [None] * (len(source_schema) - len(r))
-        fixed.append(r)
+        best, best_score = None, None
+        for cand in candidates:
+            rr = r[:len(cand)] if len(r) > len(cand) else r + [None] * (len(cand) - len(r))
+            sc = _row_score(rr, cand)
+            if best_score is None or sc > best_score:
+                best, best_score, best_row = cand, sc, rr
+        rows_by_schema[len(best)] = rows_by_schema.get(len(best), 0) + 1
+        # 先用該列自己的結構建 Series，再依欄位名稱對映到目前結構
+        fixed.append(dict(zip(best, best_row)))
 
-    # 先用「資料當時的結構」建表，再依欄位名稱對映到目前結構。
-    # 這一步是關鍵：中間插入的新欄位會被放到正確位置並留空，
+    if len(rows_by_schema) > 1:
+        print(f"\n  ⚠ 這個檔案裡混著多種欄位版本的資料列：")
+        for wdt, n in sorted(rows_by_schema.items(), reverse=True):
+            missing = [c for c in schema if c not in known.get(wdt, schema)]
+            tag = "目前版本" if wdt == w else f"舊版，缺 {missing}"
+            print(f"      {wdt} 欄 × {n} 列（{tag}）")
+        print(f"  成因：升版之後繼續往舊檔 append。每一列會依自己的版本分別對齊。")
+    elif rows_by_schema and list(rows_by_schema)[0] != w:
+        wdt = list(rows_by_schema)[0]
+        missing = [c for c in schema if c not in known.get(wdt, schema)]
+        print(f"\n  資料是 {wdt} 欄版本寫的，目前結構是 {w} 欄。")
+        print(f"  依欄位名稱對映，新增的欄位留空：{missing}")
+
+    # 依欄位名稱建表：中間插入的新欄位會落到正確位置並留空，
     # 而不是把舊資料整段往後推。
-    df = pd.DataFrame(fixed, columns=source_schema).reindex(columns=schema)
+    df = pd.DataFrame(fixed).reindex(columns=schema)
 
     if dedup:
         before = len(df)
@@ -198,12 +273,123 @@ def repair(path: Path, info: dict, schema: list[str], dedup: bool) -> None:
             print(f"    {col}: {list(vals)}")
 
 
+# 已知「本來就長得像、但刻意分開」的欄位配對。這些不是缺陷，列出來是
+# 為了讓稽核報告不要每次都把它們當成問題。
+BY_DESIGN_PAIRS = {
+    ("是否盤中執行", "已剔除未完成K棒"):
+        "前者是執行當下在不在盤中，後者是實際上有沒有砍掉未完成K棒。"
+        "09:10 執行時可能盤中=True 但沒東西可剔除=False，資料其實乾淨。",
+    ("較同批次落後天數", "是否較同批次落後"):
+        "數值與布林旗標並存是刻意的——Excel 篩選布林欄比寫數值條件方便得多。",
+    ("資料落後天數", "資料是否停滯"):
+        "同上；停滯與否的門檻是設定值，把判斷結果一併存下來才不用回頭推算。",
+    ("殖利率(%)", "殖利率是否異常"): "數值與異常旗標並存，方便直接篩掉異常值。",
+    ("負債權益比", "負債權益比是否異常"): "同上。",
+}
+
+
+def audit_columns(path: Path, schema: list[str]) -> int:
+    """
+    稽核欄位是否有重複或無用。
+
+    ⚠ 判讀重點：「這批資料每一列的值都相同」不等於「這兩欄是重複的」。
+    資料乾淨時，一堆布林旗標會通通是 False，彼此當然相同——那是巧合，
+    不是缺陷。所以下面會把「已知刻意分開的配對」單獨標示出來，
+    剩下的才需要你判斷。
+    """
+    df = pd.read_excel(path, sheet_name=SHEET)
+    work = df.drop(columns=[c for c in ("完整終端輸出",) if c in df.columns])
+    n = len(work)
+
+    print("\n" + "=" * 66)
+    print(f"  欄位稽核：{path.name}（{n} 列 × {len(df.columns)} 欄）")
+    print("=" * 66)
+
+    names = list(schema)
+    dup_names = sorted({c for c in names if names.count(c) > 1})
+    print(f"\n【1】名稱重複的欄位：{dup_names if dup_names else '無'}")
+
+    print(f"\n【2】這批資料中值完全相同的欄位配對")
+    import itertools
+    pairs = []
+    for x, y in itertools.combinations(work.columns, 2):
+        sx, sy = work[x], work[y]
+        if sx.isna().all() and sy.isna().all():
+            continue
+        try:
+            if sx.equals(sy):
+                pairs.append((x, y))
+        except Exception:
+            pass
+    if not pairs:
+        print("    無")
+    else:
+        known, unknown = [], []
+        for x, y in pairs:
+            note = BY_DESIGN_PAIRS.get((x, y)) or BY_DESIGN_PAIRS.get((y, x))
+            (known if note else unknown).append((x, y, note))
+        if known:
+            print("\n    ── 刻意分開的（不是缺陷）──")
+            for x, y, note in known:
+                print(f"    · {x} / {y}")
+                print(f"      {note}")
+        if unknown:
+            print(f"\n    ── 需要你判斷的 {len(unknown)} 組 ──")
+            for x, y, _ in unknown:
+                print(f"    · {x} / {y}")
+            print(f"\n    ⚠ 只有 {n} 列資料時，布林旗標很容易剛好都相同。")
+            print(f"      累積到數十列、且出現過異常情況之後再看這一段才準。")
+
+    print(f"\n【3】整欄全空的欄位")
+    empty = [c for c in work.columns if work[c].isna().all()]
+    # 空欄不一定是問題。分成三類：本來就該空的、有對應指令可以補的、真的異常。
+    expected = {
+        "跳過原因": "沒有標的被跳過（好事）",
+        "交易日曆提醒": "假日清單尚未到期",
+        "執行當下價格": "沒有盤中執行（只有盤中才會記錄）",
+        "Strategy_Decision_信心(%)": "沒有出現 Buy/Sell 訊號時本來就是空的",
+        "實際目標日收盤": "等預測目標日收盤後由 log_review 回填",
+        "實際報酬(%)": "同上", "實際方向": "同上",
+        "是否命中_邏輯迴歸": "同上", "是否命中_RF": "同上",
+        "是否命中_綜合分數": "同上", "回填時間": "同上",
+        "外資佔量比重5日斜率": "本地快取需累積 5 個不同交易日才會開始計算",
+    }
+    fixable = {
+        "操作建議": "advice", "建議買進價": "advice", "建議理由": "advice",
+        "建議停損價": "advice", "建議目標價": "advice", "Risk_Reward_Ratio": "advice",
+    }
+    normal = [c for c in empty if c in expected]
+    todo = [c for c in empty if c in fixable]
+    odd = [c for c in empty if c not in expected and c not in fixable]
+
+    if normal:
+        print(f"    · 本來就該空的 {len(normal)} 欄：")
+        for c in normal:
+            print(f"      {c}：{expected[c]}")
+    if todo:
+        print(f"\n    → 可以補起來的 {len(todo)} 欄：")
+        print(f"      {'、'.join(todo)}")
+        print(f"      這些是舊版紀錄沒有的欄位，執行下面這行就會補上：")
+        print(f"        python stock.py advice")
+    if odd:
+        print(f"\n    ⚠ 預期不該空、需要你確認的 {len(odd)} 欄：")
+        for c in odd:
+            print(f"      · {c}")
+    if not empty:
+        print("    無")
+
+    print("\n" + "=" * 66)
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="stock_analysis_log 表頭錯位修復")
     ap.add_argument("log", type=Path)
     ap.add_argument("--check", action="store_true", help="只檢查，不修改檔案")
     ap.add_argument("--dedup", action="store_true",
                     help="同時移除重複紀錄（同一檔、同一資料基準日只留最後一筆）")
+    ap.add_argument("--audit", action="store_true",
+                    help="稽核欄位是否有重複或無用（不修改檔案）")
     args = ap.parse_args(argv)
 
     if not args.log.exists():
@@ -211,6 +397,9 @@ def main(argv=None) -> int:
         return 1
 
     schema = load_schema()
+    if args.audit:
+        return audit_columns(args.log, schema)
+
     info = inspect(args.log, schema)
     if not info["ok"]:
         print(f"✗ {info['reason']}")

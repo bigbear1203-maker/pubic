@@ -13,6 +13,7 @@
     python stock.py compare    比較活躍股預測 v2.1 / v3.0 / v3.1
     python stock.py settle     結算出清模擬部位（想收尾時才用）
     python stock.py repair     修復欄位錯位的紀錄檔
+    python stock.py audit      稽核欄位是否重複或無用（不改檔案）
     python stock.py check      環境自檢：套件、檔案、版本、設定
     python stock.py archive    把舊版程式移到 舊版/ 資料夾
 
@@ -242,6 +243,7 @@ def cmd_overview() -> int:
     print("    compare  比較活躍股預測各版本")
     print("    settle   結算出清模擬部位")
     print("    repair   修復欄位錯位的紀錄檔")
+    print("    audit    稽核欄位是否重複或無用")
     print("    archive  把舊版程式移到 舊版/")
     print("    sim-init 重新建立一輪模擬")
     print("\n  設定集中在 stock_settings.json，改那一個檔案就好。")
@@ -304,6 +306,8 @@ def main(argv=None) -> int:
         return run("log_review.py", [str(log), "--write-back"] + extra)
     if cmd == "repair":
         return run("repair_log.py", [str(log), "--dedup"] + extra)
+    if cmd == "audit":
+        return run("repair_log.py", [str(log), "--audit"] + extra)
     if cmd == "advice":
         return run("add_action_column.py", [str(log), "--print"] + extra)
     if cmd == "compare":
