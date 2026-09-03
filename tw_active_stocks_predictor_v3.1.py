@@ -92,10 +92,22 @@ OUTPUT_FILE = OUTPUT_DIR / f"台股活躍股預測_v3.1_{datetime.date.today().i
 # DNS 解析失敗」的情況——某些企業 DNS 或 VPN 只解析得到其中一個。
 # 因此改為依序嘗試；第一個成功的會被記住，之後不再重試前面失敗的。
 TWSE_HOSTS = ["www.twse.com.tw", "twse.com.tw"]
-TWSE_PATH = "/exchangeReport/MI_INDEX"
+
+# TWSE 近年把網站改版成 RWD 架構，舊的 /exchangeReport/... 路徑正在陸續
+# 搬到 /rwd/zh/afterTrading/...。改版是分批進行的，所以同一時間可能兩個
+# 都還能用、也可能舊的突然停掉。這裡依序嘗試，哪個回得出 JSON 就用哪個。
+#
+# ⚠ 新路徑是依 TWSE 改版慣例列入的備援，未在本機實測過。若舊路徑失效
+#   而新路徑也不通，請自行到 TWSE 網站查目前的端點並更新這份清單——
+#   程式會明確告訴你是「連不上」還是「端點回應不對」，不會混為一談。
+TWSE_PATHS = [
+    "/exchangeReport/MI_INDEX",          # 長年使用的路徑
+    "/rwd/zh/afterTrading/MI_INDEX",     # 改版後的路徑（備援）
+]
+TWSE_PATH = TWSE_PATHS[0]
 TWSE_URL = f"https://{TWSE_HOSTS[0]}{TWSE_PATH}"   # 相容舊程式碼的引用
 
-_WORKING_HOST = None      # 已確認可用的主機，成功一次之後就固定用它
+_WORKING_ENDPOINT = None   # (host, path)：成功一次之後就固定用它
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -228,34 +240,49 @@ def fetch_twse_day(date_str: str) -> pd.DataFrame:
     這兩件事必須分開：舊版把網路錯誤也印成「無資料（可能為假日）」，
     等於在使用者網路斷線時告訴他今天是假日，然後繼續重試上百次。
     """
-    global _WORKING_HOST
+    global _WORKING_ENDPOINT
     params = {"response": "json", "date": date_str, "type": "ALLBUT0999"}
 
-    # 已經找到可用主機就只試那一個，否則依序嘗試
-    hosts = [_WORKING_HOST] if _WORKING_HOST else list(TWSE_HOSTS)
-    last_error = None
+    # 已經找到可用端點就只試那一個；否則主機 × 路徑逐一嘗試
+    if _WORKING_ENDPOINT:
+        candidates = [_WORKING_ENDPOINT]
+    else:
+        candidates = [(h, p) for h in TWSE_HOSTS for p in TWSE_PATHS]
 
-    for host in hosts:
-        url = f"https://{host}{TWSE_PATH}"
+    last_network_error = None
+    http_errors = []
+    data = None
+
+    for host, path in candidates:
+        url = f"https://{host}{path}"
         try:
             resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
         except requests.exceptions.RequestException as e:
-            last_error = e
-            if _WORKING_HOST is None and host != hosts[-1]:
-                print(f"    · {host} 連不上（{_short_network_reason(e)}），改試 {hosts[hosts.index(host) + 1]}")
+            last_network_error = e
             continue
-        except Exception as e:
-            print(f"    {date_str} 回應解析失敗：{type(e).__name__}: {e}")
-            return None
 
-        if _WORKING_HOST != host:
-            _WORKING_HOST = host
-            print(f"    · 使用主機 {host}")
+        # 4xx/5xx 代表「連得上但這個端點不對」，與網路不通是兩回事，
+        # 應該換下一個端點試，而不是判定成網路故障。
+        if resp.status_code >= 400:
+            http_errors.append(f"{url} → HTTP {resp.status_code}")
+            continue
+        try:
+            data = resp.json()
+        except Exception:
+            http_errors.append(f"{url} → 回應不是 JSON（可能被導向網頁版）")
+            continue
+
+        if _WORKING_ENDPOINT != (host, path):
+            _WORKING_ENDPOINT = (host, path)
+            print(f"    · 使用端點 https://{host}{path}")
         break
     else:
-        raise NetworkUnavailable(_short_network_reason(last_error)) from last_error
+        if last_network_error is not None and not http_errors:
+            raise NetworkUnavailable(_short_network_reason(last_network_error)) from last_network_error
+        detail = "；".join(http_errors[:4])
+        raise NetworkUnavailable(
+            f"連得上 TWSE，但所有已知端點都回應不正確：{detail}。"
+            f"這通常代表 TWSE 改版換了網址，請更新程式裡的 TWSE_PATHS")
 
     if data.get("stat") != "OK":
         return None
@@ -362,18 +389,22 @@ def fetch_panel_data(n_days: int, now: datetime.datetime = None) -> pd.DataFrame
                 last_net_reason = str(e)
                 print(f"    ✗ 連線失敗（{net_fail_streak}/{MAX_CONSECUTIVE_NETWORK_FAILURES}）：{e}")
                 if net_fail_streak >= MAX_CONSECUTIVE_NETWORK_FAILURES:
+                    tried = "".join(f"      https://{h}{p}\n"
+                                    for h in TWSE_HOSTS for p in TWSE_PATHS)
                     raise RuntimeError(
                         f"連續 {net_fail_streak} 次連不上 TWSE，停止重試。\n"
                         f"  原因：{last_net_reason}\n"
-                        f"  已嘗試的主機：{'、'.join(TWSE_HOSTS)}\n"
-                        f"\n  這不是假日、也不是程式的問題，是這台電腦連不到 TWSE。\n"
-                        f"  請依序確認（注意有沒有 www，兩者可能不同）：\n"
-                        f"    1. Resolve-DnsName www.twse.com.tw\n"
-                        f"    2. Resolve-DnsName twse.com.tw\n"
+                        f"  已嘗試的端點：\n{tried}"
+                        f"\n  這不是假日、也不是程式的問題。請依序確認\n"
+                        f"  （注意有沒有 www，兩者可能不同）：\n"
+                        f"    1. 瀏覽器貼上這個完整網址，看是否出現 JSON：\n"
+                        f"       https://www.twse.com.tw/exchangeReport/MI_INDEX"
+                        f"?response=json&date=20260902&type=ALLBUT0999\n"
+                        f"    2. Resolve-DnsName www.twse.com.tw\n"
                         f"    3. Test-NetConnection www.twse.com.tw -Port 443\n"
                         f"    4. VPN 是否剛連上或斷線、公司 proxy 是否擋住\n"
-                        f"\n  若只有其中一個網域解析得到，把 TWSE_HOSTS 的順序調換即可。\n"
-                        f"  網路恢復後重跑即可，先前的紀錄不受影響。"
+                        f"\n  若第 1 步看得到 JSON、程式卻連不上，多半是 proxy 只放行\n"
+                        f"  瀏覽器而擋住 Python。網路恢復後重跑即可，紀錄不受影響。"
                     ) from None
                 time.sleep(2.0)
                 current -= datetime.timedelta(days=1)
