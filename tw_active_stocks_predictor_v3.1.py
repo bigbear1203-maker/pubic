@@ -2,7 +2,16 @@
 """
 台股活躍股預測程式 v3.1
 ========================
-v3.0 -> v3.1 修正（兩項都是 v2.1 就存在、v3.0 沿用下來的問題）：
+v3.0 -> v3.1 修正（皆為 v2.1 就存在、v3.0 沿用下來的問題）：
+
+  [重大] 網路錯誤被誤報為「假日」。連不上 TWSE 時，舊版一律印
+         「無資料（可能為假日/停市/欄位異常），略過」，然後繼續重試——
+         回看 30 天最多會試 110 次、每次逾時 15 秒，等於在使用者網路
+         斷線的情況下花約 30 分鐘印出上百行誤導訊息才失敗。
+         v3.1 把「連不上」與「當天沒有資料」分成兩件事：前者丟出
+         NetworkUnavailable，連續 3 次即停止並直接指出是網路問題、
+         附上檢查步驟；後者才是假日，維持原本的略過邏輯。
+         同時把冗長的 requests 例外訊息壓成一句人看得懂的話。
 
   [重大] 抓取起點永遠從「昨天」開始，導致最新一個交易日的資料拿得到
          卻沒被使用。TWSE 在收盤後（約 14:00 起）就會發布當日 MI_INDEX，
@@ -179,10 +188,32 @@ def is_common_stock(stock_id: str, stock_name: str = "") -> bool:
 # 資料抓取（證交所官方公開 API）
 # ============================================================
 
+class NetworkUnavailable(Exception):
+    """連不上 TWSE。這與「當天是假日沒有資料」完全是兩回事，必須分開處理。"""
+
+
+def _short_network_reason(exc: Exception) -> str:
+    """把冗長的 requests 例外訊息壓成一句人看得懂的話。"""
+    text = str(exc)
+    if "getaddrinfo failed" in text or "NameResolutionError" in text:
+        return "DNS 解析失敗——連網域名稱都查不到，通常是網路斷線或 DNS 設定有問題"
+    if "10065" in text or "unreachable" in text.lower():
+        return "無法路由到主機——網路可通但到不了 TWSE，常見於 VPN 或公司防火牆"
+    if "timed out" in text.lower() or "ConnectTimeout" in text:
+        return "連線逾時——可能被防火牆或 proxy 擋住"
+    if "SSLError" in text or "certificate" in text.lower():
+        return "TLS 憑證驗證失敗——通常是公司網路的中間人代理"
+    return text.split("(Caused by")[0].strip()[:120]
+
+
 def fetch_twse_day(date_str: str) -> pd.DataFrame:
     """
     抓取指定日期（YYYYMMDD）全部上市股票的日成交資料。
-    若當天是假日或無資料，回傳 None。
+
+    回傳 None 代表「當天沒有資料」（假日、停市）。
+    連不上 TWSE 時會丟出 NetworkUnavailable，不會回傳 None——
+    這兩件事必須分開：舊版把網路錯誤也印成「無資料（可能為假日）」，
+    等於在使用者網路斷線時告訴他今天是假日，然後繼續重試上百次。
     """
     params = {"response": "json", "date": date_str, "type": "ALLBUT0999"}
 
@@ -190,8 +221,10 @@ def fetch_twse_day(date_str: str) -> pd.DataFrame:
         resp = requests.get(TWSE_URL, params=params, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         data = resp.json()
+    except requests.exceptions.RequestException as e:
+        raise NetworkUnavailable(_short_network_reason(e)) from e
     except Exception as e:
-        print(f"    {date_str} 抓取失敗：{e}")
+        print(f"    {date_str} 回應解析失敗：{type(e).__name__}: {e}")
         return None
 
     if data.get("stat") != "OK":
@@ -280,19 +313,46 @@ def fetch_panel_data(n_days: int, now: datetime.datetime = None) -> pd.DataFrame
     attempts = 0
     max_attempts = n_days * 3 + 20
 
+    # 連續網路失敗的容忍次數。超過就直接放棄——與其花 30 分鐘重試 110 次
+    # 再告訴使用者失敗，不如 1 分鐘內講清楚「你連不上網」。
+    MAX_CONSECUTIVE_NETWORK_FAILURES = 3
+    net_fail_streak = 0
+    last_net_reason = ""
+
     while len(frames) < n_days and attempts < max_attempts:
         attempts += 1
 
         if current.weekday() < 5:
             date_str = current.strftime("%Y%m%d")
             print(f"  嘗試抓取 {date_str} ...")
-            df = fetch_twse_day(date_str)
+            try:
+                df = fetch_twse_day(date_str)
+            except NetworkUnavailable as e:
+                net_fail_streak += 1
+                last_net_reason = str(e)
+                print(f"    ✗ 連線失敗（{net_fail_streak}/{MAX_CONSECUTIVE_NETWORK_FAILURES}）：{e}")
+                if net_fail_streak >= MAX_CONSECUTIVE_NETWORK_FAILURES:
+                    raise RuntimeError(
+                        f"連續 {net_fail_streak} 次連不上 TWSE，停止重試。\n"
+                        f"  原因：{last_net_reason}\n"
+                        f"\n  這不是假日、也不是程式的問題，是這台電腦到 "
+                        f"www.twse.com.tw 的網路不通。請依序確認：\n"
+                        f"    1. 瀏覽器能不能開 https://www.twse.com.tw\n"
+                        f"    2. Resolve-DnsName www.twse.com.tw\n"
+                        f"    3. Test-NetConnection www.twse.com.tw -Port 443\n"
+                        f"    4. VPN 是否剛連上或斷線、公司 proxy 是否擋住\n"
+                        f"\n  網路恢復後重跑即可，先前的紀錄不受影響。"
+                    ) from None
+                time.sleep(2.0)
+                current -= datetime.timedelta(days=1)
+                continue
 
+            net_fail_streak = 0     # 有成功連上就重置
             if df is not None and not df.empty:
                 print(f"    OK，取得 {len(df)} 檔普通股資料")
                 frames.append(df)
             else:
-                print("    無資料（可能是假日/停市/欄位異常），略過")
+                print("    無資料（假日/停市），略過")
 
             time.sleep(1.0)
 
