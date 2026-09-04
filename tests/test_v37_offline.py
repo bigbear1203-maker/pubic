@@ -43,7 +43,16 @@ def check(name, cond, detail=""):
 
 
 def make_ohlcv(n_days=620, seed=7, end_date=None):
-    """合成一段有波動、有量的日K資料。用固定種子確保可重現。"""
+    """
+    合成一段有波動、有量的日K資料。用固定種子確保可重現。
+
+    ⚠ end_date 預設是固定日期（2026-08-28），這是為了讓測試結果可重現。
+    但代價是：只要測試中有任何程式路徑會呼叫 datetime.now()，隨著真實
+    日期往後推移，這批資料就會逐漸「變舊」而觸發資料停滯檢查——測到的
+    就變成日曆而不是程式。因此**凡是會走到 analyze() 或新鮮度檢查的
+    測試，都必須凍結時鐘**（見 [7] 與 [9] 的 _FrozenDT 寫法），
+    或改用 now= 參數明確傳入時間點。
+    """
     rng = np.random.default_rng(seed)
     end_date = end_date or datetime.date(2026, 8, 28)
     idx = pd.bdate_range(end=pd.Timestamp(end_date), periods=n_days, tz="Asia/Taipei")
@@ -238,10 +247,24 @@ def main():
     print("\n[9] 資料不足 / 停滯 → Skipped_*，不會混入「中性」")
     with tempfile.TemporaryDirectory() as td:
         m = load_analyzer()
-        install_offline_stubs(m, make_ohlcv(n_days=120), datetime.date(2026, 8, 28))
+        install_offline_stubs(m, make_ohlcv(n_days=120))
         m.EXCEL_LOG_PATH = os.path.join(td, "log.xlsx")
-        m.analyze("020020.TW")
-        df = pd.read_excel(m.EXCEL_LOG_PATH)
+        # 必須凍結時鐘。合成資料的最後交易日固定在 2026-08-28，若用真實
+        # 時間執行，隨著日子過去資料會「變舊」，先被資料停滯檢查攔下，
+        # 這個測試就會改成收到 Skipped_資料停滯 而失敗——測到的是日曆，
+        # 不是程式。（本測試確實在 2026-09-03 因此失敗過一次。）
+        real_dt = m.datetime.datetime
+
+        class _FrozenDT9(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.datetime(2026, 8, 28, 15, 0)
+        m.datetime.datetime = _FrozenDT9
+        try:
+            m.analyze("020020.TW")
+            df = pd.read_excel(m.EXCEL_LOG_PATH)
+        finally:
+            m.datetime.datetime = real_dt
         last = df.iloc[-1]
         check("資料不足 → Strategy_Decision = Skipped_資料不足",
               last["Strategy_Decision"] == "Skipped_資料不足", str(last["Strategy_Decision"]))
