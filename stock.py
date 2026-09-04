@@ -14,6 +14,7 @@
     python stock.py settle     結算出清模擬部位（想收尾時才用）
     python stock.py repair     修復欄位錯位的紀錄檔
     python stock.py audit      稽核欄位是否重複或無用（不改檔案）
+    python stock.py merge      把 Excel 寫入失敗時的 CSV 備援併回主紀錄
     python stock.py check      環境自檢：套件、檔案、版本、設定
     python stock.py archive    把舊版程式移到 舊版/ 資料夾
 
@@ -244,6 +245,12 @@ def cmd_overview() -> int:
     print(f"\n  紀錄檔：{log.name if log else '尚未建立'}")
     if others:
         print(f"          （另有 {len(others)} 個備份/舊版檔案，不會被使用）")
+    fb = [p for p in ROOT.glob("*_fallback.csv") if "已合併" not in p.name]
+    if fb:
+        total = sum(p.stat().st_size for p in fb) / 1024
+        print(f"  ⚠ 有 {len(fb)} 個 CSV 備援檔（{total:.0f} KB）尚未合併——")
+        print(f"     那是 Excel 被鎖住時存下的紀錄，目前不在任何統計裡。")
+        print(f"     執行 python stock.py merge 併回主紀錄。")
     print(f"  模擬：  {'進行中' if state.exists() else '尚未建立'}")
 
     print("\n  最常用")
@@ -258,6 +265,7 @@ def cmd_overview() -> int:
     print("    settle   結算出清模擬部位")
     print("    repair   修復欄位錯位的紀錄檔")
     print("    audit    稽核欄位是否重複或無用")
+    print("    merge    把 CSV 備援併回主紀錄")
     print("    archive  把舊版程式移到 舊版/")
     print("    sim-init 重新建立一輪模擬")
     print("\n  設定集中在 stock_settings.json，改那一個檔案就好。")
@@ -322,6 +330,8 @@ def main(argv=None) -> int:
         return run("repair_log.py", [str(log), "--dedup"] + extra)
     if cmd == "audit":
         return run("repair_log.py", [str(log), "--audit"] + extra)
+    if cmd == "merge":
+        return run("merge_fallback.py", ["--log", str(log)] + extra)
     if cmd == "advice":
         return run("add_action_column.py", [str(log), "--print"] + extra)
     if cmd == "compare":
