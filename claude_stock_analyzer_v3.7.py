@@ -1845,6 +1845,10 @@ EXCEL_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock
 # Excel 儲存格文字上限約 32,767 字元；保留緩衝，超過此長度就截斷。
 FULL_OUTPUT_MAX_CHARS = 30000
 
+# 「紀錄檔欄位與目前版本不一致」的提醒，一次執行只顯示一次。
+# 由 _run_batch() 在批次開始時重置。
+_SCHEMA_WARNING_SHOWN = False
+
 EXCEL_LOG_COLUMNS = [
     "執行時間", "股票代碼", "公司名稱", "股價日期(資料基準日)", "預測目標日(隔日估計)", "目前股價", "幣別",
     # v3.7 新增：執行情境。沒有這幾欄就無法事後區分「盤中跑的」與「收盤後跑的」，
@@ -1965,15 +1969,22 @@ def _append_to_excel_log(record, path=None):
             # 與欄位數不符，就代表這個檔案已經被寫壞過，不能再往裡面 append。
             width_mismatch = (ws.max_row >= 1 and ws.max_column > len(EXCEL_LOG_COLUMNS))
             if existing_header != EXCEL_LOG_COLUMNS or width_mismatch:
+                global _SCHEMA_WARNING_SHOWN
                 fallback_path = path.replace(".xlsx", f"_v{VERSION}.xlsx")
-                why = ("工作表實際寬度為 %d 欄、超過目前版本的 %d 欄，該檔案先前已被"
-                       "混版寫入而錯位" % (ws.max_column, len(EXCEL_LOG_COLUMNS))
-                       ) if width_mismatch else "欄位名稱與目前版本不一致，可能是舊版本程式建立的檔案"
-                print(f"  ⚠ 既有 Excel 紀錄檔（{path}）{why}。為避免破壞既有資料，"
-                      f"本次改寫入新檔案: {fallback_path}")
-                if width_mismatch:
-                    print(f"     舊檔的欄位已經錯位，統計前請先用 tools/repair_log.py 修復：")
-                    print(f"       python repair_log.py \"{path}\" --dedup")
+                # 這個提醒每分析一檔就會觸發一次。批次跑 10 檔就洗 10 次版面，
+                # 而它講的是同一件事，只需要說一次。
+                if not _SCHEMA_WARNING_SHOWN:
+                    _SCHEMA_WARNING_SHOWN = True
+                    why = ("工作表實際寬度為 %d 欄、超過目前版本的 %d 欄，該檔案先前已被"
+                           "混版寫入而錯位" % (ws.max_column, len(EXCEL_LOG_COLUMNS))
+                           ) if width_mismatch else "欄位名稱與目前版本不一致（舊版程式建立的）"
+                    print(f"  ℹ 紀錄檔說明（本次執行只顯示一次）：")
+                    print(f"     {os.path.basename(path)} {why}，")
+                    print(f"     為避免破壞舊資料，改寫入 {os.path.basename(fallback_path)}。")
+                    print(f"     這是刻意的保護機制，不是錯誤，新紀錄都會正確存進新檔。")
+                    if width_mismatch:
+                        print(f"     ⚠ 但舊檔的欄位已經錯位，統計前請先修復：")
+                        print(f"        python repair_log.py \"{path}\" --dedup")
                 path = fallback_path
                 if os.path.exists(path):
                     wb = load_workbook(path)
@@ -2856,8 +2867,9 @@ def _run_batch(symbols, pause_sec=1.0):
     v3.6 補強：過濾掉空白/空字串代碼(避免指令列多打一個空格就整個中斷)，
     結尾加上成功/失敗筆數統計。
     """
-    global _BATCH_LATEST_DATE
-    _BATCH_LATEST_DATE = None   # 每次批次重新開始比較基準
+    global _BATCH_LATEST_DATE, _SCHEMA_WARNING_SHOWN
+    _BATCH_LATEST_DATE = None      # 每次批次重新開始比較基準
+    _SCHEMA_WARNING_SHOWN = False  # 紀錄檔說明每次批次只顯示一次
 
     clean_symbols = [s.strip() for s in symbols if s and s.strip()]
     if not clean_symbols:

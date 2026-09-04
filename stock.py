@@ -64,12 +64,22 @@ def find(name: str) -> Path | None:
     return None
 
 
+# 資料夾裡除了正在用的紀錄檔，還會有備份、修復前檔、CSV 備援、舊版留下的
+# 檔案，檔名都以 stock_analysis_log 開頭。單純取「最近修改的那一個」很容易
+# 指到備份檔——那會讓後續的 repair / advice / review 全部作用在錯的檔案上，
+# 而且不會有任何錯誤訊息。
+LOG_EXCLUDE_KEYWORDS = ("備份", "old file", "fallback", "已修復", "修復前", "加建議前")
+
+
 def find_log() -> Path | None:
-    """找出目前在用的紀錄檔，優先取最近修改的那一個。"""
-    cands = sorted(ROOT.glob("stock_analysis_log*.xlsx"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    cands = [p for p in cands if "備份" not in p.name]
-    return cands[0] if cands else None
+    """找出目前在用的紀錄檔。排除備份與衍生檔，再取最近修改的那一個。"""
+    cands = [p for p in ROOT.glob("stock_analysis_log*.xlsx")
+             if not any(k in p.name for k in LOG_EXCLUDE_KEYWORDS)]
+    if not cands:
+        return None
+    # 同名情況下優先用 _v3.7（目前版本寫入的目標），其次才看修改時間
+    cands.sort(key=lambda p: ("v3.7" in p.name, p.stat().st_mtime), reverse=True)
+    return cands[0]
 
 
 def run(script: str, args: list[str]) -> int:
@@ -229,7 +239,11 @@ def cmd_overview() -> int:
 
     log = find_log()
     state = ROOT / "paper_trading_state.json"
+    others = [p.name for p in ROOT.glob("stock_analysis_log*.xlsx")
+              if log is None or p.name != log.name]
     print(f"\n  紀錄檔：{log.name if log else '尚未建立'}")
+    if others:
+        print(f"          （另有 {len(others)} 個備份/舊版檔案，不會被使用）")
     print(f"  模擬：  {'進行中' if state.exists() else '尚未建立'}")
 
     print("\n  最常用")
