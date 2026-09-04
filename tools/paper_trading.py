@@ -82,7 +82,12 @@ import pandas as pd
 # 參數
 # ============================================================
 
-DEFAULT_STATE = Path("paper_trading_state.json")
+# 狀態檔預設放在「這支程式自己所在的資料夾」，不是「你執行時所在的資料夾」。
+# 兩者的差別很要命：若寫成相對路徑 Path("paper_trading_state.json")，
+# 從別的資料夾執行時會找不到既有的模擬狀態，然後靜靜地建立一個全新的、
+# 空的模擬——你的持股與績效看起來就像憑空消失了，而且不會有任何錯誤訊息。
+# 其他程式（predictor / analyzer / pipeline）都是用 __file__ 定位，這裡統一。
+DEFAULT_STATE = Path(__file__).resolve().parent / "paper_trading_state.json"
 
 
 
