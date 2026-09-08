@@ -15,6 +15,7 @@
     python stock.py repair     修復欄位錯位的紀錄檔
     python stock.py audit      稽核欄位是否重複或無用（不改檔案）
     python stock.py merge      把 Excel 寫入失敗時的 CSV 備援併回主紀錄
+    python stock.py events     事件日曆：哪幾天不適合開新倉
     python stock.py check      環境自檢：套件、檔案、版本、設定
     python stock.py archive    把舊版程式移到 舊版/ 資料夾
 
@@ -26,7 +27,6 @@
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import json
 import shutil
@@ -43,7 +43,8 @@ CURRENT = {
     "個股分析": ["claude_stock_analyzer_v3.7.py"],
     "整合流程": ["tw_stock_pipeline_v1.1.py"],
     "工具": ["paper_trading.py", "log_review.py", "compare_predictors.py",
-             "repair_log.py", "add_action_column.py"],
+             "repair_log.py", "add_action_column.py", "merge_fallback.py",
+             "event_calendar.py"],
 }
 
 OBSOLETE_PATTERNS = [
@@ -229,6 +230,35 @@ def cmd_archive(dry: bool) -> int:
     return 0
 
 
+def _print_upcoming_events(today: dt.date, days: int = 7) -> None:
+    """
+    在總覽畫面帶出未來幾天的事件日。只是提醒，不做任何判斷——
+    事件能告訴你的是「那天波動會變大」，不是「那天會漲或會跌」。
+
+    事件日曆讀不到時安靜跳過：總覽是每次執行都會看到的畫面，
+    不該因為一個附加資訊而噴一堆錯誤。
+    """
+    try:
+        sys.path.insert(0, str(ROOT / "tools"))
+        from event_calendar import TradingCalendar, events_between
+    except Exception:                                           # noqa: BLE001
+        return
+    try:
+        cal = TradingCalendar()
+        ev = events_between(today, today + dt.timedelta(days=days), cal)
+    except Exception:                                           # noqa: BLE001
+        return
+    if not ev:
+        return
+    print(f"\n  未來 {days} 天的事件日（波動偏大，建議不開新倉）")
+    for d in sorted(ev):
+        rel = (d - today).days
+        when = "今天" if rel == 0 else f"{rel} 天後"
+        print(f"    {d}（{'一二三四五六日'[d.weekday()]}）{when:>6s}　"
+              + "、".join(ev[d]))
+    print("    細節：python stock.py events")
+
+
 def cmd_overview() -> int:
     """不帶參數時顯示：目前狀態 + 可用指令。"""
     today = dt.date.today()
@@ -253,6 +283,8 @@ def cmd_overview() -> int:
         print(f"     執行 python stock.py merge 併回主紀錄。")
     print(f"  模擬：  {'進行中' if state.exists() else '尚未建立'}")
 
+    _print_upcoming_events(today)
+
     print("\n  最常用")
     print("    python stock.py daily      每個交易日收盤後跑（15:00 之後）")
     print("    python stock.py report     看模擬績效")
@@ -266,6 +298,7 @@ def cmd_overview() -> int:
     print("    repair   修復欄位錯位的紀錄檔")
     print("    audit    稽核欄位是否重複或無用")
     print("    merge    把 CSV 備援併回主紀錄")
+    print("    events   事件日曆（--stats 比較事件日與一般日）")
     print("    archive  把舊版程式移到 舊版/")
     print("    sim-init 重新建立一輪模擬")
     print("\n  設定集中在 stock_settings.json，改那一個檔案就好。")
@@ -277,23 +310,37 @@ def cmd_overview() -> int:
 # 主流程
 # ============================================================
 
+# 這裡刻意不用 argparse 解析。stock.py 的工作是「把指令連同參數原封不動
+# 轉給下層工具」，而 argparse 會把它不認得的 --flag 當成錯誤攔下來，或者
+# 更糟——把它認得的（例如 --dry-run）吃掉，讓下層工具收不到。
+#
+# 那不是理論上的風險：舊版就是這樣讓 `stock.py merge --dry-run` 變成
+# 「真的合併下去」，而畫面上不會有任何一句話告訴你 dry-run 沒有生效。
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(
-        description="台股分析系統統一入口", add_help=True)
-    ap.add_argument("command", nargs="?", default=None, help="要執行的指令")
-    ap.add_argument("extra", nargs="*", help="轉給下層工具的額外參數")
-    ap.add_argument("--dry-run", action="store_true", help="archive 專用：只顯示不移動")
-    args = ap.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
 
-    cmd = args.command
-    extra = list(args.extra)
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+
+    # 第一個不是 --flag 的參數是指令，其餘全部原樣轉給下層工具。
+    if argv and not argv[0].startswith("-"):
+        cmd, extra = argv[0], argv[1:]
+    else:
+        cmd, extra = None, argv
+
+    dry_run = "--dry-run" in extra
 
     if cmd is None:
+        if extra:
+            print(f"✗ 缺少指令。收到的是「{' '.join(extra)}」，"
+                  "指令要放在最前面，例如 python stock.py merge --dry-run\n")
+            return cmd_overview() or 1
         return cmd_overview()
     if cmd == "check":
         return cmd_check()
     if cmd == "archive":
-        return cmd_archive(args.dry_run)
+        return cmd_archive(dry_run)
 
     if cmd == "daily":
         return run("tw_stock_pipeline_v1.1.py", extra)
@@ -318,6 +365,9 @@ def main(argv=None) -> int:
         if not cfg.get("allow_odd_lot", True):
             a.append("--lot-only")
         return run("paper_trading.py", a + extra)
+
+    if cmd == "events":
+        return run("event_calendar.py", extra)
 
     log = find_log()
     if cmd in ("review", "repair", "advice") and log is None:
