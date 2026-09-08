@@ -239,7 +239,10 @@ def _print_upcoming_events(today: dt.date, days: int = 7) -> None:
     不該因為一個附加資訊而噴一堆錯誤。
     """
     try:
-        sys.path.insert(0, str(ROOT / "tools"))
+        # tools\ 是正規位置，但檔案很容易被直接放進主資料夾，兩邊都要找。
+        for _p in (ROOT / "tools", ROOT):
+            if str(_p) not in sys.path:
+                sys.path.insert(0, str(_p))
         from event_calendar import TradingCalendar, events_between
     except Exception:                                           # noqa: BLE001
         return

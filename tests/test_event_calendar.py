@@ -15,8 +15,24 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "tools"))
+def _find_root() -> Path:
+    """
+    找出專案主資料夾（放著 stock.py 的那一層）。
+
+    這支測試設計上放在 tests\ 底下，但很容易被直接放進主資料夾，那時
+    parent.parent 就會指到主資料夾的上一層——實測就發生過，結果是一路
+    往上撈到別的專案的舊檔，測試訊息完全看不出真正原因。
+    """
+    here = Path(__file__).resolve().parent
+    for cand in (here, here.parent, here.parent.parent, Path.cwd()):
+        if (cand / "stock.py").exists():
+            return cand
+    return here.parent
+
+
+ROOT = _find_root()
+for _p in (ROOT, ROOT / "tools"):
+    sys.path.insert(0, str(_p))
 
 import event_calendar as ec                                     # noqa: E402
 
@@ -39,8 +55,11 @@ D = dt.date
 # ----------------------------------------------------------------------
 def test_calendar_source():
     print("\n[1] 交易日曆來自分析程式，不是自己複製一份")
-    holidays, coverage, note = ec.load_trading_calendar()
+    holidays, coverage, note, source = ec.load_trading_calendar()
     check("成功讀到假日清單", not note and len(holidays) > 0, note)
+    check("有回報實際用的來源檔",
+          source is not None and source.name.startswith("claude_stock_analyzer_v"),
+          str(source))
     check("讀到 2026 春節（2/16）", D(2026, 2, 16) in holidays)
     check("讀到 2026 中秋（9/25）", D(2026, 9, 25) in holidays)
     check("讀到涵蓋截止日", coverage == D(2026, 12, 31), str(coverage))
@@ -52,10 +71,75 @@ def test_calendar_source():
 
     # 讀不到來源時必須明講，而不是安靜地用空清單
     missing = ROOT / "不存在的檔案_zzz.py"
-    h2, _, note2 = ec.load_trading_calendar(missing)
-    check("來源讀不到時回報原因而非安靜失敗", h2 == set() and bool(note2), note2)
+    h2, _, note2, src2 = ec.load_trading_calendar(missing)
+    check("來源讀不到時回報原因而非安靜失敗",
+          h2 == set() and bool(note2) and src2 is None, note2)
     bad_cal = ec.TradingCalendar(holidays=set(), coverage_until=None, note=note2)
     check("空清單的 TradingCalendar 會帶著提醒", bool(bad_cal.note))
+
+
+def test_analyzer_selection():
+    """
+    實測回歸：使用者把 event_calendar.py 放進主資料夾（而不是 tools\），
+    parent.parent 就指到上一層，在那裡撈到一支 claude_stock_analyzer_v3.5_2330.py
+    （單股實驗檔），於是回報「找不到 TW_HOLIDAYS」。
+
+    症狀出現在假日相關的斷言上，但真正的原因是「挑到錯的檔案」——這種錯
+    不會噴例外，只會把事件日期安靜算在錯的日子上。
+    """
+    print("\n[1b] 挑對分析程式（實測回歸）")
+    ok_names = ["claude_stock_analyzer_v3.7.py", "claude_stock_analyzer_v3.6.py",
+                "claude_stock_analyzer_v10.0.py"]
+    bad_names = ["claude_stock_analyzer_v3.5_2330.py",
+                 "claude_stock_analyzer_v3.7_test.py",
+                 "claude_stock_analyzer_v3.7.py.bak",
+                 "claude_stock_analyzer.py", "claude_stock_analyzer_v3.py"]
+    for n in ok_names:
+        check(f"認得正式版本檔名：{n}", ec._ANALYZER_RE.match(n) is not None)
+    for n in bad_names:
+        check(f"不把實驗/衍生檔當成分析程式：{n}", ec._ANALYZER_RE.match(n) is None)
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "claude_stock_analyzer_v3.5_2330.py").write_text(
+            "# 單股實驗檔，沒有 TW_HOLIDAYS\n", encoding="utf-8")
+        (d / "claude_stock_analyzer_v3.6.py").write_text(
+            "import datetime\nTW_HOLIDAYS = {datetime.date(2026, 1, 1)}\n",
+            encoding="utf-8")
+        (d / "claude_stock_analyzer_v3.7.py").write_text(
+            "import datetime\n"
+            "TW_HOLIDAYS = {datetime.date(2026, 2, 16), datetime.date(2026, 9, 25)}\n"
+            "TW_HOLIDAY_COVERAGE_UNTIL = datetime.date(2026, 12, 31)\n",
+            encoding="utf-8")
+
+        found = []
+        for f in d.iterdir():
+            m = ec._ANALYZER_RE.match(f.name)
+            if m:
+                found.append(((int(m.group(1)), int(m.group(2))), f))
+        found.sort(key=lambda t: t[0], reverse=True)
+        check("同資料夾多版本時挑版本最高的（3.7 而不是 3.6）",
+              found and found[0][1].name == "claude_stock_analyzer_v3.7.py",
+              str([f.name for _, f in found]))
+        check("v3.5_2330 完全不在候選名單裡",
+              all("2330" not in f.name for _, f in found))
+
+        h, c, note, src = ec.load_trading_calendar(d / "claude_stock_analyzer_v3.7.py")
+        check("指定檔案時讀得到假日", not note and len(h) == 2, note)
+        check("指定檔案時回報涵蓋截止日", c == D(2026, 12, 31), str(c))
+
+        h, c, note, src = ec.load_trading_calendar(
+            d / "claude_stock_analyzer_v3.5_2330.py")
+        check("沒有 TW_HOLIDAYS 的檔案會明確回報",
+              h == set() and "找不到 TW_HOLIDAYS" in note, note)
+
+    roots = [str(r) for r in ec._search_roots()]
+    here = Path(ec.__file__).resolve().parent
+    check("搜尋路徑含 event_calendar.py 自己所在的資料夾",
+          str(here) in roots, str(roots))
+    check("搜尋路徑含上一層（放錯資料夾時靠這條救回來）",
+          str(here.parent) in roots, str(roots))
+    check("搜尋路徑沒有重複", len(roots) == len(set(roots)), str(roots))
 
 
 # ----------------------------------------------------------------------
@@ -261,7 +345,12 @@ def test_stats():
 # ----------------------------------------------------------------------
 def test_stock_py_passthrough():
     print("\n[9] stock.py 參數轉發（--dry-run 曾被吃掉）")
-    src = (ROOT / "stock.py").read_text(encoding="utf-8")
+    stock_py = ROOT / "stock.py"
+    if not stock_py.exists():
+        check(f"找得到 stock.py（目前找的是 {stock_py}）", False,
+              "測試檔應放在 tests\\ 底下，stock.py 應在它的上一層")
+        return
+    src = stock_py.read_text(encoding="utf-8")
     check("dispatcher 不再用 argparse 解析",
           "ap.add_argument(\"command\"" not in src)
     check("events 有接到 dispatcher", 'cmd == "events"' in src)
@@ -269,7 +358,7 @@ def test_stock_py_passthrough():
     check("dry_run 從 extra 判斷", 'dry_run = "--dry-run" in extra' in src)
 
     import importlib.util
-    spec = importlib.util.spec_from_file_location("stock_entry", ROOT / "stock.py")
+    spec = importlib.util.spec_from_file_location("stock_entry", stock_py)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
 
@@ -300,6 +389,7 @@ def main():
     print("  事件日曆離線測試")
     print("=" * 64)
     test_calendar_source()
+    test_analyzer_selection()
     test_settlement()
     test_revenue()
     test_events_between()

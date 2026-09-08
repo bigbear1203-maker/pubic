@@ -46,6 +46,7 @@ import argparse
 import ast
 import calendar
 import datetime as dt
+import re
 import sys
 import unicodedata
 from pathlib import Path
@@ -63,12 +64,61 @@ ROOT = Path(__file__).resolve().parent.parent
 # 也刻意不在這裡自己複製一份假日清單。複製出來的第二份清單一定會跟本尊
 # 走鐘，而且走鐘的時候不會有任何錯誤訊息——它只會安靜地把統計算錯。
 
-_ANALYZER_GLOB = "claude_stock_analyzer_v3.*.py"
+# 只認「claude_stock_analyzer_v<主>.<次>.py」這個嚴格格式。
+#
+# 為什麼要嚴格？因為 glob "claude_stock_analyzer_v3.*.py" 會連
+# claude_stock_analyzer_v3.5_2330.py 這種單股實驗檔一起撈進來，再用字串
+# 排序取最後一個，就可能挑到錯的檔案——而挑錯的下場是假日清單讀不到，
+# 事件日期全部算在錯的日子上。
+_ANALYZER_RE = re.compile(r"^claude_stock_analyzer_v(\d+)\.(\d+)\.py$")
+_ANALYZER_DESC = "claude_stock_analyzer_v<版本>.py（例如 claude_stock_analyzer_v3.7.py）"
+
+
+def _search_roots() -> list[Path]:
+    """
+    分析程式可能在哪裡。
+
+    這支工具設計上放在 tools\ 底下，但實際上很容易被直接放進主資料夾
+    （複製檔案時少開一層），那時 parent.parent 就會指到主資料夾的**上一層**，
+    在那裡撈到別的專案留下的舊檔。所以不要只賭一個位置，依「離自己最近」
+    的順序逐一找，找到就停。
+    """
+    here = Path(__file__).resolve().parent
+    roots = [here, here / "tools", here.parent, here.parent / "tools",
+             Path.cwd(), Path.cwd() / "tools"]
+    seen, out = set(), []
+    for r in roots:
+        key = str(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _analyzer_candidates() -> list[Path]:
+    """
+    回傳所有候選分析程式，版本高的排前面。
+
+    先在最接近的資料夾裡找；那一層有東西就不再往外找——往外找很容易
+    翻到別的資料夾裡的舊版，而用舊版的假日清單不會噴錯，只會安靜算錯。
+    """
+    for root in _search_roots():
+        if not root.is_dir():
+            continue
+        found = []
+        for f in root.iterdir():
+            m = _ANALYZER_RE.match(f.name)
+            if m:
+                found.append(((int(m.group(1)), int(m.group(2))), f))
+        if found:
+            found.sort(key=lambda t: t[0], reverse=True)
+            return [f for _, f in found]
+    return []
 
 
 def _find_analyzer() -> Path | None:
-    cands = sorted(ROOT.glob(_ANALYZER_GLOB))
-    return cands[-1] if cands else None
+    cands = _analyzer_candidates()
+    return cands[0] if cands else None
 
 
 def _date_from_call(node) -> dt.date | None:
@@ -86,30 +136,22 @@ def _date_from_call(node) -> dt.date | None:
         return None
 
 
-def load_trading_calendar(analyzer: Path | None = None):
-    """
-    回傳 (holidays:set[date], coverage_until:date|None, source_note:str)。
-
-    讀不到時回傳空集合，並在 source_note 裡明講——呼叫端必須把這個提醒
-    顯示出來，因為「假日清單是空的」會讓所有事件日期悄悄算錯。
-    """
-    path = analyzer or _find_analyzer()
-    if path is None:
-        return set(), None, f"找不到 {_ANALYZER_GLOB}，無法取得台股假日清單"
+def _parse_one(path: Path):
+    """從單一檔案抽出 (holidays, coverage, 失敗原因)。"""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError) as e:
-        return set(), None, f"讀取 {path.name} 失敗：{e}"
+    except (OSError, SyntaxError, UnicodeDecodeError) as e:
+        return set(), None, f"讀取 {path.name} 失敗：{type(e).__name__}: {e}"
 
     holidays: set[dt.date] = set()
     coverage: dt.date | None = None
-    found_holidays = False
+    found = False
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
         names = {t.id for t in node.targets if isinstance(t, ast.Name)}
         if "TW_HOLIDAYS" in names and isinstance(node.value, (ast.Set, ast.List, ast.Tuple)):
-            found_holidays = True
+            found = True
             for elt in node.value.elts:
                 d = _date_from_call(elt)
                 if d is not None:
@@ -117,20 +159,51 @@ def load_trading_calendar(analyzer: Path | None = None):
         elif "TW_HOLIDAY_COVERAGE_UNTIL" in names:
             coverage = _date_from_call(node.value)
 
-    if not found_holidays:
+    if not found:
         return set(), coverage, f"{path.name} 裡找不到 TW_HOLIDAYS"
     return holidays, coverage, ""
+
+
+def load_trading_calendar(analyzer: Path | None = None):
+    """
+    回傳 (holidays:set[date], coverage_until:date|None, source_note:str,
+          source:Path|None)。
+
+    讀不到時回傳空集合，並在 source_note 裡明講——呼叫端必須把這個提醒
+    顯示出來，因為「假日清單是空的」會讓所有事件日期悄悄算錯。
+
+    指定 analyzer 時只試那一支；沒指定時依版本由新到舊逐一試，某一支
+    沒有 TW_HOLIDAYS（例如單股實驗檔）就換下一支，而不是直接放棄。
+    """
+    if analyzer is not None:
+        h, c, note = _parse_one(analyzer)
+        return h, c, note, (None if note else analyzer)
+
+    cands = _analyzer_candidates()
+    if not cands:
+        return set(), None, f"找不到 {_ANALYZER_DESC}，無法取得台股假日清單", None
+
+    reasons = []
+    for path in cands:
+        h, c, note = _parse_one(path)
+        if not note:
+            return h, c, "", path
+        reasons.append(note)
+    return set(), None, "；".join(reasons), None
 
 
 class TradingCalendar:
     """只負責回答「這天有沒有開市」，以及往前往後找交易日。"""
 
-    def __init__(self, holidays=None, coverage_until=None, note=""):
+    def __init__(self, holidays=None, coverage_until=None, note="", source=None):
         if holidays is None:
-            holidays, coverage_until, note = load_trading_calendar()
+            holidays, coverage_until, note, source = load_trading_calendar()
         self.holidays = set(holidays)
         self.coverage_until = coverage_until
         self.note = note
+        # 實際用了哪一支分析程式的假日清單。要印出來給人看——挑到錯的檔案
+        # 是這裡最可能出事的地方，而它不會有任何症狀，只會把日期算錯。
+        self.source = source
 
     def is_trading_day(self, d: dt.date) -> bool:
         return d.weekday() < 5 and d not in self.holidays
@@ -574,9 +647,17 @@ def main(argv=None) -> int:
 
     cal = TradingCalendar()
     if cal.note:
-        print(f"⚠ {cal.note}")
-        print("  沒有假日清單時，遇到國定假日的事件日期會算錯。請先確認"
-              f"{_ANALYZER_GLOB} 在同一個資料夾裡。\n")
+        print(f"⚠ 讀不到台股假日清單：{cal.note}")
+        print("  沒有假日清單時，週末會跳過，但遇到國定假日的事件日期會算錯。")
+        print(f"  請確認 {_ANALYZER_DESC} 跟這支工具在同一層、或在它的上一層資料夾。")
+        print("  找過的位置：")
+        for r in _search_roots():
+            print(f"    {'✓' if r.is_dir() else '×'} {r}")
+        print()
+    else:
+        # 挑到錯的分析程式不會有任何症狀，只會安靜地把日期算錯，
+        # 所以每次都把實際用的來源印出來讓你核對。
+        print(f"假日清單來源：{cal.source}")
 
     if args.stats:
         log = Path(args.log) if args.log else _find_log()
