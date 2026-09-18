@@ -67,6 +67,23 @@ def read_log(path):
 # 共用工具
 # ----------------------------------------------------------------------
 
+def find_file(name: str) -> Path | None:
+    """
+    在「自己所在層 → 上一層 → 各自的 tools\」依序找檔案。
+
+    不要寫死 ROOT/"tools"/<name>：實測上 paper_trading.py 很可能被放在
+    主資料夾而不是 tools\，寫死路徑就會在那台機器上直接找不到。
+    這跟 stock.py 的 find() 是同一個策略。
+    """
+    here = Path(__file__).resolve().parent
+    for base in (here, here / "tools", here.parent, here.parent / "tools",
+                 Path.cwd(), Path.cwd() / "tools"):
+        cand = base / name
+        if cand.exists():
+            return cand
+    return None
+
+
 def _load_module(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     m = importlib.util.module_from_spec(spec)
@@ -536,12 +553,18 @@ def _gap_slippage(trades: pd.DataFrame, df: pd.DataFrame):
 # 總結
 # ----------------------------------------------------------------------
 
-def final_verdict(g1, g2, g3, issues):
+def final_verdict(g1, g2, g3, issues: list[str] | None):
     _hr("結論")
     print(f"  Gate 1  模型有沒有 edge        {verdict(g1)}")
     print(f"  Gate 2  有沒有贏過不做         {verdict(g2)}")
     print(f"  Gate 3  成本是否覆蓋得住       {verdict(g3)}")
-    print(f"  Gate 4  執行品質               {'發現 ' + str(len(issues)) + ' 項問題' if issues else '無明顯問題'}")
+    if issues is None:
+        g4_text = "未執行（缺少模擬狀態或紀錄檔）"
+    elif issues:
+        g4_text = f"發現 {len(issues)} 項問題"
+    else:
+        g4_text = "已檢查，無明顯問題"
+    print(f"  Gate 4  執行品質               {g4_text}")
 
     print("\n  建議")
     print("  " + "-" * 66)
@@ -631,21 +654,30 @@ def main(argv=None) -> int:
         print("  （沒有紀錄檔，跳過）")
 
     g2 = g3 = None
-    issues: list[str] = []
+    # None = 這一關根本沒跑；[] = 跑了而且沒發現問題。
+    # 兩者絕不能混為一談——把「沒檢查」報成「沒問題」是最糟的一種錯誤訊息。
+    issues: list[str] | None = None
     if state_path:
         sys.path.insert(0, str(state_path.parent))
         sys.path.insert(0, str(ROOT / "tools"))
         try:
-            pt = _load_module(ROOT / "tools" / "paper_trading.py", "paper_trading")
+            pt_path = find_file("paper_trading.py")
+            if pt_path is None:
+                raise FileNotFoundError(
+                    "找不到 paper_trading.py（已在主資料夾與 tools\\ 都找過）")
+            pt = _load_module(pt_path, "paper_trading")
             sim = pt.Simulator.load(state_path)
         except Exception as e:                                     # noqa: BLE001
             print(f"\n  ✗ 載入模擬狀態失敗：{type(e).__name__}: {e}")
+            print("     Gate 2 / 3 無法執行。Gate 4 改用紀錄檔能檢查的部分。")
             sim = None
         if sim is not None:
             trades = sim.all_trades()
             g2 = gate2_benchmark(sim)
             g3 = gate3_cost(sim, trades)
             issues = gate4_execution(sim, trades, df)
+        elif not df.empty:
+            issues = gate4_execution_logonly(df)
     else:
         _hr("Gate 2 / 3")
         print("  （找不到 paper_trading_state.json，跳過）")

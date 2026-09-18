@@ -344,8 +344,70 @@ def test_same_day_stops():
     check("當天換股（非停損）的 Z 不算", all(f["symbol"] != "Z" for f in found))
 
 
+def test_tool_discovery():
+    """
+    實測回歸：evaluate.py 原本寫死 ROOT/"tools"/paper_trading.py。
+    使用者的 paper_trading.py 放在主資料夾，於是 Gate 2/3 直接掛掉。
+    """
+    print("\n[9] paper_trading.py 放哪裡都要找得到（實測回歸）")
+    check("有 find_file 而非寫死路徑", hasattr(ev, "find_file"))
+    src = (ROOT / "tools" / "evaluate.py").read_text(encoding="utf-8")
+    check("原本的寫死路徑已移除",
+          '_load_module(ROOT / "tools" / "paper_trading.py"' not in src)
+    found = ev.find_file("paper_trading.py")
+    check("在本專案找得到 paper_trading.py", found is not None and found.exists(),
+          str(found))
+    check("找不到的檔案回傳 None", ev.find_file("絕對不存在_zzz.py") is None)
+
+
+def test_gate4_not_run_vs_no_issues():
+    """
+    實測回歸：模擬載入失敗時 Gate 4 根本沒跑，總結卻印「無明顯問題」。
+    把「沒檢查」報成「沒問題」是最糟的一種錯誤訊息——它會讓人放心地
+    帶著沒被檢查過的系統下真錢。
+    """
+    print("\n[10] 「沒檢查」不能被講成「沒問題」")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ev.final_verdict(False, None, None, None)
+    out = buf.getvalue()
+    check("issues=None → 顯示未執行", "未執行" in out,
+          [l for l in out.splitlines() if "Gate 4" in l])
+    check("issues=None 時不得出現「無明顯問題」", "無明顯問題" not in out)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ev.final_verdict(False, None, None, [])
+    out = buf.getvalue()
+    check("issues=[] → 顯示已檢查無問題", "已檢查，無明顯問題" in out,
+          [l for l in out.splitlines() if "Gate 4" in l])
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ev.final_verdict(False, None, None, ["停損太緊"])
+    out = buf.getvalue()
+    check("有問題時列出項目", "發現 1 項問題" in out and "停損太緊" in out)
+
+    # 模擬載入失敗，但紀錄檔還在 → Gate 4 仍應跑紀錄檔那半邊
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        log = td / "stock_analysis_log_v3.7.xlsx"
+        make_log(log, 46.0)
+        state = td / "paper_trading_state.json"
+        state.write_text('{"壞掉": true}', encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ev.main(["--log", str(log), "--state", str(state)])
+        out = buf.getvalue()
+        check("state 壞掉不會讓整支失敗", rc == 0)
+        check("明講 Gate 2/3 無法執行", "Gate 2 / 3 無法執行" in out)
+        check("Gate 4 仍然跑了紀錄檔那半邊",
+              "已檢查，無明顯問題" in out or "發現" in out,
+              [l for l in out.splitlines() if "Gate 4" in l])
+
+
 def test_stock_py_wiring():
-    print("\n[9] stock.py 接線")
+    print("\n[11] stock.py 接線")
     src = (ROOT / "stock.py").read_text(encoding="utf-8")
     check("evaluate 有接到 dispatcher", 'cmd == "evaluate"' in src)
     check("evaluate 列在工具清單", '"evaluate.py"' in src)
@@ -373,6 +435,8 @@ def main():
     test_missing_inputs()
     test_slippage_pairing()
     test_same_day_stops()
+    test_tool_discovery()
+    test_gate4_not_run_vs_no_issues()
     test_stock_py_wiring()
     print("\n" + "=" * 64)
     print(f"  通過 {_passed} 項 / 失敗 {_failed} 項")
