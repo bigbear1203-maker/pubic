@@ -162,7 +162,8 @@ def main():
                   str(same_day[same_day > 1].head()))
 
         s = sim.summary()
-        check("報告含全部 6 個策略", len(s) == 6)
+        check(f"報告含全部 {len(m.STRATEGIES)} 個策略",
+              len(s) == len(m.STRATEGIES), f"{len(s)} vs {len(m.STRATEGIES)}")
         cash_ret = float(s[s["策略"] == "cash"]["報酬率(%)"].iloc[0])
         check("cash 策略報酬率為 0（什麼都沒做）", abs(cash_ret) < 1e-9, cash_ret)
         check("有交易的策略累計成本 > 0",

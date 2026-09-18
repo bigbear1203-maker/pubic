@@ -135,13 +135,32 @@ TAX_SELL = _setting("券商與稅費", "securities_tax_pct", 0.3) / 100.0
 SHARES_PER_LOT = 1000
 
 STRATEGIES = ("strategy_decision", "ev_decision", "score_topn",
-              "prob_topn", "active_equal", "cash")
+              "prob_topn", "active_equal", "cash",
+              # v1.2 變體對照組：每一個只改 score_topn 的「一個」變數，
+              # 這樣哪個改動有效才歸因得清楚。同時改兩件事就分不出是誰的功勞。
+              "score_lowturn", "score_limit", "etf_hold")
 
 # 排名型策略：規則是「持有當下的前 N 名」，所以跌出名單就換掉。
-RANKING_STRATEGIES = ("score_topn", "prob_topn", "active_equal")
+RANKING_STRATEGIES = ("score_topn", "prob_topn", "active_equal",
+                      "score_lowturn", "score_limit")
 # 訊號型策略：規則是「看到 Buy 才進場」，Wait 代表沒有意見，不是叫你賣，
 # 所以只在出現明確 Sell 或超過最長持有天數時才出場。
 SIGNAL_STRATEGIES = ("strategy_decision", "ev_decision")
+# 買進持有型：不換股、不停損、不受最長持有天數限制。
+# 唯一的意義是回答「你不如直接買大盤」這個問題。
+BUY_HOLD_STRATEGIES = ("etf_hold",)
+
+# --- 變體參數（實測依據見 docs/操作總覽.md）-----------------------------
+# 實測：15 個交易日、41~45 次買進、年化交易成本 55.7%。周轉是最大的
+# 已量化漏水之一，而降周轉不需要任何預測能力。
+LOWTURN_EXIT_RANK_MULT = 2    # 跌出「前 N×2」名才換股（而非跌出前 N 名）
+LOWTURN_HOLD_MULT = 2         # 最長持有天數加倍
+
+# 實測：買進滑價平均 +0.49%，95% 區間 [+0.11%, +0.88%]，不含 0 → 統計顯著。
+# 比整個來回成本 0.471% 還大。限價單的代價是有時買不到，好處是不追高。
+LIMIT_ENTRY_SLACK = 0.0       # 限價 = 訊號日收盤價 ×(1+slack)，0 表示不追高
+
+ETF_SYMBOL = "0050.TW"        # 大盤對照組
 
 STRATEGY_DESC = {
     "strategy_decision": "只在 Strategy_Decision=Buy 時買進（現行規則）",
@@ -150,6 +169,10 @@ STRATEGY_DESC = {
     "prob_topn": "隔日上漲機率最高的前 N 名等權買進",
     "active_equal": "分析清單前 N 名等權買進（活躍度對照組）",
     "cash": "全現金，什麼都不做（最重要的對照組）",
+    "score_lowturn": f"同 score_topn，但跌出前 N×{LOWTURN_EXIT_RANK_MULT} 名才換、"
+                     f"持有上限 ×{LOWTURN_HOLD_MULT}（只改周轉）",
+    "score_limit": "同 score_topn，但限價進場，開高不追（只改進場價）",
+    "etf_hold": f"買進並持有 {ETF_SYMBOL}，全程不動（大盤對照組）",
 }
 
 
@@ -348,13 +371,27 @@ def _clean_signals(log_path: Path, basis_date: dt.date) -> pd.DataFrame:
 
 def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int) -> list[tuple[str, str]]:
     """回傳 [(symbol, 理由), ...]。cash 策略永遠回傳空清單。"""
-    if strategy == "cash" or signals.empty:
+    if strategy == "cash":
+        return []
+
+    # etf_hold 不看訊號，所以要擋在 signals.empty 之前：分析程式沒跑
+    # 或當天沒有訊號時，大盤對照組還是該照買。
+    if strategy == "etf_hold":
+        return [(ETF_SYMBOL, f"買進並持有 {ETF_SYMBOL}（大盤對照組）")]
+
+    if signals.empty:
         return []
 
     s = signals.copy()
 
     if strategy == "strategy_decision":
-        picked = s[s.get("Strategy_Decision", pd.Series(dtype=object)) == "Buy"]
+        # 要先確認欄位存在再比對。s.get(..., 空 Series) 在欄位不存在時回傳
+        # 一個索引對不上的空 Series，拿它當布林索引 pandas 會直接丟
+        # IndexingError，整個模擬中斷——而缺欄位只該讓這個策略沒得挑，
+        # 不該讓其他八個策略一起陪葬。ev_decision 本來就是這樣寫的。
+        if "Strategy_Decision" not in s.columns:
+            return []
+        picked = s[s["Strategy_Decision"] == "Buy"]
         return [(r["股票代碼"], f"Strategy_Decision=Buy（信心 {r.get('Strategy_Decision_信心(%)')}）")
                 for _, r in picked.iterrows()][:top_n]
 
@@ -365,9 +402,15 @@ def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int) -> list[tuple
         return [(r["股票代碼"], f"EV_Decision=Buy（淨EV {r.get('EV_淨期望值(%)')}%）")
                 for _, r in picked.iterrows()][:top_n]
 
-    if strategy == "score_topn":
+    if strategy in ("score_topn", "score_lowturn", "score_limit"):
+        # 三個變體共用同一套排名。差別只在出場規則與成交條件，
+        # 不在選股——這樣才能把效果歸因到那一個改動上。
         picked = s[s["綜合分數"] > 0].sort_values("綜合分數", ascending=False).head(top_n)
         return [(r["股票代碼"], f"綜合分數 {r['綜合分數']}") for _, r in picked.iterrows()]
+
+    if strategy in ("score_topn", "score_lowturn", "score_limit") \
+            and "綜合分數" not in s.columns:
+        return []
 
     if strategy == "prob_topn":
         col = "隔日_邏輯迴歸_上漲機率(%)"
@@ -384,9 +427,31 @@ def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int) -> list[tuple
     return []
 
 
+def keep_universe(strategy: str, signals: pd.DataFrame, top_n: int) -> set[str]:
+    """
+    「還可以繼續抱」的名單。預設就是今日目標（跌出前 N 名就換）。
+
+    score_lowturn 用較寬的名次帶：跌到第 6 名就賣掉、隔天回到第 5 名又買回來，
+    這種來回每次都要付 0.471%，而名次在 5 與 6 之間跳動本身多半是雜訊。
+    """
+    if strategy != "score_lowturn" or signals.empty or "綜合分數" not in signals:
+        return set()
+    wide = (signals[signals["綜合分數"] > 0]
+            .sort_values("綜合分數", ascending=False)
+            .head(top_n * LOWTURN_EXIT_RANK_MULT))
+    return set(wide["股票代碼"])
+
+
+def holding_days_for(strategy: str, base_days: int) -> int:
+    """各策略的最長持有天數。低周轉變體加倍。"""
+    if strategy == "score_lowturn":
+        return base_days * LOWTURN_HOLD_MULT
+    return base_days
+
+
 def pick_exits(strategy: str, signals: pd.DataFrame, positions: dict,
                targets: list[tuple[str, str]], max_holding_days: int,
-               today: dt.date) -> dict:
+               today: dt.date, keep: set[str] | None = None) -> dict:
     """
     決定今天要出場的部位。回傳 {symbol: 出場理由}。
 
@@ -409,7 +474,12 @@ def pick_exits(strategy: str, signals: pd.DataFrame, positions: dict,
     if not positions:
         return exits
 
-    # 1. 時間停損（所有策略共用）
+    # 買進持有型完全不出場：它的規則就是「買了不動」，
+    # 套用時間停損或換股都會讓它不再是那個對照組。
+    if strategy in BUY_HOLD_STRATEGIES:
+        return exits
+
+    # 1. 時間停損（其餘策略共用）
     for sym, pos in positions.items():
         try:
             held = (today - dt.date.fromisoformat(str(pos["entry_date"]))).days
@@ -423,10 +493,13 @@ def pick_exits(strategy: str, signals: pd.DataFrame, positions: dict,
 
     # 2. 排名型：跌出名單就換股
     if strategy in RANKING_STRATEGIES:
-        tgt = {sym for sym, _ in targets}
+        # keep 非空時用它（低周轉變體的寬名次帶），否則就是今日目標。
+        tgt = set(keep) if keep else {sym for sym, _ in targets}
+        label = (f"已跌出前 {len(tgt)} 名，換股" if keep
+                 else "已跌出今日名單，換股")
         for sym in positions:
             if sym not in tgt and sym not in exits:
-                exits[sym] = "已跌出今日名單，換股"
+                exits[sym] = label
 
     # 3. 訊號型：只認明確的 Sell
     elif strategy in SIGNAL_STRATEGIES:
@@ -447,10 +520,18 @@ def pick_exits(strategy: str, signals: pd.DataFrame, positions: dict,
 class Simulator:
     def __init__(self, state: dict):
         self.state = state
+        cap = state["initial_capital"]
         self.portfolios = {
-            name: Portfolio(name, state["initial_capital"], data)
+            name: Portfolio(name, cap, data)
             for name, data in state["portfolios"].items()
         }
+        # 舊狀態檔沒有新加入的策略。補上它們（全現金起跑），而不是
+        # 要求重新開一輪——重開會丟掉已經累積的歷史。
+        # 它們的起算日比較晚，summary() 會把「起算日」印出來，
+        # 因為總報酬率跨不同期間是不能直接比的。
+        self.newly_added = [n for n in STRATEGIES if n not in self.portfolios]
+        for name in self.newly_added:
+            self.portfolios[name] = Portfolio(name, cap)
 
     # ---------- 建立 / 存讀 ----------
     @classmethod
@@ -531,13 +612,19 @@ class Simulator:
         for name, p in self.portfolios.items():
             if not p.pending:
                 continue
-            filled, failed = 0, 0
+            filled, failed, skipped_limit = 0, 0, 0
             for order in self._sell_first(p.pending):
                 px = prices.get(order["symbol"], {}).get("open")
                 if px is None:
                     failed += 1
                     continue
                 if order["side"] == "buy":
+                    lim = order.get("limit")
+                    if lim is not None and px > lim:
+                        # 開高於限價 → 不成交。這是策略本身的規則，
+                        # 不是失敗，所以不計入 failed。
+                        skipped_limit += 1
+                        continue
                     shares = self._size_position(p, order, px, prices)
                     stop_price = self._stop_price_from_fill(px, order.get("atr"))
                     if shares > 0 and p.execute_buy(order["symbol"], shares, px, date,
@@ -553,7 +640,8 @@ class Simulator:
                     else:
                         failed += 1
             print(f"      {name:18s} 成交 {filled} 筆"
-                  + (f"，未成交 {failed} 筆（資金不足或取不到價）" if failed else ""))
+                  + (f"，未成交 {failed} 筆（資金不足或取不到價）" if failed else "")
+                  + (f"，開高未成交 {skipped_limit} 筆（限價）" if skipped_limit else ""))
             p.pending = []
 
         print(f"\n[3/4] 收盤檢查停損 / 標記市值")
@@ -640,6 +728,10 @@ class Simulator:
         實際交易若掛停損單，出場價通常會比這裡模擬的更差。
         """
         stopped = 0
+        if p.name in BUY_HOLD_STRATEGIES:
+            # 買進持有的規則就是不停損。套用停損會讓它變成另一種策略，
+            # 也就不再是「你不如直接買大盤」的對照組。
+            return 0
         for sym in list(p.positions):
             pos = p.positions[sym]
             px = prices.get(sym, {}).get("close")
@@ -667,8 +759,10 @@ class Simulator:
         讓換股釋放出來的現金當天就能用。
         """
         targets = pick_targets(strategy, signals, self.cfg["top_n"])
-        exits = pick_exits(strategy, signals, p.positions, targets,
-                           self.cfg["max_holding_days"], today)
+        exits = pick_exits(
+            strategy, signals, p.positions, targets,
+            holding_days_for(strategy, self.cfg["max_holding_days"]), today,
+            keep=keep_universe(strategy, signals, self.cfg["top_n"]))
 
         orders: list[dict] = [
             {"symbol": sym, "side": "sell", "reason": reason}
@@ -690,10 +784,15 @@ class Simulator:
             return orders
 
         equity = p.equity(prices) or self.state["initial_capital"]
-        # 換股賣出後會有現金進來，所以預算用「權益 ÷ 目標檔數」而不是
-        # 只看當下現金——否則換股當天會因為錢還沒回來而買不進去。
-        budget = min(equity * 0.98 / max(self.cfg["top_n"], 1),
-                     equity * self.cfg["max_position_pct"])
+        if strategy in BUY_HOLD_STRATEGIES:
+            # 大盤對照組只有一個部位，不套用單檔上限——那個上限是為了
+            # 分散個股風險而設的，ETF 本身就已經是分散的組合。
+            budget = equity * 0.98
+        else:
+            # 換股賣出後會有現金進來，所以預算用「權益 ÷ 目標檔數」而不是
+            # 只看當下現金——否則換股當天會因為錢還沒回來而買不進去。
+            budget = min(equity * 0.98 / max(self.cfg["top_n"], 1),
+                         equity * self.cfg["max_position_pct"])
 
         # 注意：這裡要 append 到既有的 orders（裡面已經有賣單），
         # 不能重新指派成空 list——那會把換股的賣單整個清掉，
@@ -701,13 +800,26 @@ class Simulator:
         # 只帶 ATR 值，不預先算停損價——停損必須以「實際成交價」為基準。
         # 訊號是 D 日收盤後產生的，D+1 開盤價可能跳空，若拿 D 日收盤價去算
         # 停損線，遇到跳空就會算出高於成交價的停損價，一買進當天就被掃出場。
-        atr_map = dict(zip(signals["股票代碼"], signals.get("ATR", pd.Series(dtype=float))))
+        if signals is None or signals.empty:
+            atr_map, px_map = {}, {}
+        else:
+            atr_map = dict(zip(signals["股票代碼"],
+                               signals.get("ATR", pd.Series(dtype=float))))
+            px_map = dict(zip(signals["股票代碼"],
+                              signals.get("目前股價", pd.Series(dtype=float))))
         for sym, reason in targets:
             atr = atr_map.get(sym)
-            orders.append({
+            order = {
                 "symbol": sym, "side": "buy", "reason": reason, "budget": budget,
                 "atr": None if atr is None or pd.isna(atr) else float(atr),
-            })
+            }
+            # 限價變體：只在隔日開盤價不高於訊號價時才成交。
+            # 買不到就算了——實測滑價平均 +0.49%，追高的代價比錯過更確定。
+            if strategy == "score_limit":
+                ref = px_map.get(sym)
+                if ref is not None and not pd.isna(ref) and float(ref) > 0:
+                    order["limit"] = float(ref) * (1 + LIMIT_ENTRY_SLACK)
+            orders.append(order)
         return orders
 
     @staticmethod
@@ -748,7 +860,8 @@ class Simulator:
 
             rows.append({
                 "策略": name,
-                "說明": STRATEGY_DESC[name],
+                "說明": STRATEGY_DESC.get(name, name),
+                "起算日": p.equity_curve[0]["date"] if p.equity_curve else "尚未起算",
                 "期末權益": eq,
                 "若現在出清淨值": net_eq,
                 "出清成本估算": liquidation_cost,
