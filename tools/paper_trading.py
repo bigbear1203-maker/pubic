@@ -138,11 +138,16 @@ STRATEGIES = ("strategy_decision", "ev_decision", "score_topn",
               "prob_topn", "active_equal", "cash",
               # v1.2 變體對照組：每一個只改 score_topn 的「一個」變數，
               # 這樣哪個改動有效才歸因得清楚。同時改兩件事就分不出是誰的功勞。
-              "score_lowturn", "score_limit", "etf_hold")
+              "score_lowturn", "score_limit", "etf_hold",
+              # v1.3 實證導向：台股是動量效應的著名例外，短期反轉才是
+              # 文獻上被反覆記錄的現象。現行的 score_topn / prob_topn
+              # 本質上都在買「剛剛表現好的」，方向正好相反。
+              "reversal_topn", "foreign_flow")
 
 # 排名型策略：規則是「持有當下的前 N 名」，所以跌出名單就換掉。
 RANKING_STRATEGIES = ("score_topn", "prob_topn", "active_equal",
-                      "score_lowturn", "score_limit")
+                      "score_lowturn", "score_limit",
+                      "reversal_topn", "foreign_flow")
 # 訊號型策略：規則是「看到 Buy 才進場」，Wait 代表沒有意見，不是叫你賣，
 # 所以只在出現明確 Sell 或超過最長持有天數時才出場。
 SIGNAL_STRATEGIES = ("strategy_decision", "ev_decision")
@@ -162,6 +167,12 @@ LIMIT_ENTRY_SLACK = 0.0       # 限價 = 訊號日收盤價 ×(1+slack)，0 表�
 
 ETF_SYMBOL = "0050.TW"        # 大盤對照組
 
+# 短期反轉的回看天數。台股文獻記錄到的反轉多在數日到數週的尺度，
+# 這裡取 5 個交易日（約一週），是紀錄檔累積速度下可行的最短窗口。
+REVERSAL_LOOKBACK_DAYS = 5
+# 回看窗口至少要有幾個觀測點才算數。只有 1 個點算不出報酬。
+REVERSAL_MIN_OBS = 3
+
 STRATEGY_DESC = {
     "strategy_decision": "只在 Strategy_Decision=Buy 時買進（現行規則）",
     "ev_decision": "只在 EV_Decision=Buy 時買進（v3.7 影子規則）",
@@ -173,6 +184,9 @@ STRATEGY_DESC = {
                      f"持有上限 ×{LOWTURN_HOLD_MULT}（只改周轉）",
     "score_limit": "同 score_topn，但限價進場，開高不追（只改進場價）",
     "etf_hold": f"買進並持有 {ETF_SYMBOL}，全程不動（大盤對照組）",
+    "reversal_topn": f"買近 {REVERSAL_LOOKBACK_DAYS} 日跌最多的前 N 名"
+                     "（台股短期反轉，與 score_topn 方向相反）",
+    "foreign_flow": "外資買賣超佔成交量比重最高的前 N 名（跟隨法人）",
 }
 
 
@@ -343,6 +357,45 @@ class Portfolio:
 # 選股規則
 # ============================================================
 
+def trailing_returns(log_path: Path, basis_date: dt.date,
+                     lookback: int = REVERSAL_LOOKBACK_DAYS) -> dict[str, float]:
+    """
+    從紀錄檔自身的歷史算出每檔的近 N 日報酬（%）。
+
+    為什麼不另外抓價：紀錄檔每天都記了「目前股價」，那就是當日收盤價。
+    用它算回看報酬不需要任何額外的網路請求，也不會引入第二個資料來源
+    ——兩個來源對不上的時候，你不會知道是哪一邊錯了。
+
+    只用 basis_date（含）以前的資料，不碰未來——這是回測最容易出錯的
+    地方，而且錯了不會有任何症狀，只會讓績效好得不真實。
+
+    觀測點少於 REVERSAL_MIN_OBS 的標的不回傳，寧可少選也不要用
+    兩個點硬算一個報酬率。
+    """
+    try:
+        df = pd.read_excel(log_path, sheet_name="分析紀錄",
+                           usecols=["股票代碼", "股價日期(資料基準日)", "目前股價"])
+    except Exception:                                              # noqa: BLE001
+        return {}
+    df["_d"] = pd.to_datetime(df["股價日期(資料基準日)"], errors="coerce").dt.date
+    df["_px"] = pd.to_numeric(df["目前股價"], errors="coerce")
+    df = df[(df["_d"].notna()) & (df["_px"] > 0) & (df["_d"] <= basis_date)]
+    if df.empty:
+        return {}
+
+    out: dict[str, float] = {}
+    for sym, g in df.groupby("股票代碼"):
+        # 同一天可能有多筆（重跑），每天只留最後一筆
+        g = g.sort_values("_d").groupby("_d", as_index=False).last()
+        g = g.tail(lookback + 1)
+        if len(g) < REVERSAL_MIN_OBS:
+            continue
+        first, last = float(g["_px"].iloc[0]), float(g["_px"].iloc[-1])
+        if first > 0:
+            out[str(sym)] = (last / first - 1) * 100
+    return out
+
+
 def _clean_signals(log_path: Path, basis_date: dt.date) -> pd.DataFrame:
     """
     從 analyzer 的 log 取出指定資料基準日的訊號，並過濾掉不可用的紀錄：
@@ -369,8 +422,13 @@ def _clean_signals(log_path: Path, basis_date: dt.date) -> pd.DataFrame:
     return sub[sub["目前股價"].notna()]
 
 
-def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int) -> list[tuple[str, str]]:
-    """回傳 [(symbol, 理由), ...]。cash 策略永遠回傳空清單。"""
+def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int,
+                 trailing: dict[str, float] | None = None) -> list[tuple[str, str]]:
+    """
+    回傳 [(symbol, 理由), ...]。cash 策略永遠回傳空清單。
+
+    trailing: {股票代碼: 近 N 日報酬%}，只有 reversal_topn 用得到。
+    """
     if strategy == "cash":
         return []
 
@@ -418,6 +476,30 @@ def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int) -> list[tuple
             return []
         picked = s[s[col].notna()].sort_values(col, ascending=False).head(top_n)
         return [(r["股票代碼"], f"隔日上漲機率 {r[col]:.1f}%") for _, r in picked.iterrows()]
+
+    if strategy == "reversal_topn":
+        # 買跌最多的。台股是動量效應的著名例外，文獻反覆記錄到的是
+        # 短期反轉——所以這一支刻意跟 score_topn 反向，當作對照。
+        if not trailing:
+            return []
+        cand = [(r["股票代碼"], trailing.get(str(r["股票代碼"])))
+                for _, r in s.iterrows()]
+        cand = [(sym, ret) for sym, ret in cand if ret is not None]
+        if not cand:
+            return []
+        cand.sort(key=lambda t: t[1])          # 由低到高：跌最多的排前面
+        return [(sym, f"近 {REVERSAL_LOOKBACK_DAYS} 日 {ret:+.1f}%（反轉）")
+                for sym, ret in cand[:top_n]]
+
+    if strategy == "foreign_flow":
+        col = "外資買賣超佔當日成交量比重(%)"
+        if col not in s.columns:
+            return []
+        v = s[pd.to_numeric(s[col], errors="coerce").notna()].copy()
+        v[col] = pd.to_numeric(v[col], errors="coerce")
+        v = v[v[col] > 0].sort_values(col, ascending=False).head(top_n)
+        return [(r["股票代碼"], f"外資買超佔量 {r[col]:.2f}%")
+                for _, r in v.iterrows()]
 
     if strategy == "active_equal":
         # 分析清單本身就是活躍度篩選的結果，順序即為活躍度排名
@@ -669,25 +751,37 @@ class Simulator:
             self.state["settled"] = True
         else:
             print(f"\n[4/4] 依 {date} 的分析結果產生明日委託單")
+            # 近 N 日報酬只有反轉策略用得到，算一次給所有策略共用。
+            trailing = (trailing_returns(log_path, date)
+                        if log_path is not None and log_path.exists() else {})
             if signals.empty:
-                print("      ⚠ log 中找不到這一天的分析結果（資料基準日不符），今日不產生新單。")
+                print("      ⚠ log 中找不到這一天的分析結果（資料基準日不符）。")
                 print("        請確認你已在收盤後執行過 claude_stock_analyzer_v3.7。")
+                # 買進持有型不看訊號，分析程式沒跑也該照常建立部位——
+                # 否則大盤對照組會因為「你那天忘了跑分析」而缺一段，
+                # 之後的比較就不公平了。
+                todo = [(n, p) for n, p in self.portfolios.items()
+                        if n in BUY_HOLD_STRATEGIES]
+                if todo:
+                    print(f"      （{len(todo)} 個買進持有策略不受影響，照常產生委託單）")
             else:
                 print(f"      可用訊號 {len(signals)} 檔")
-                for name, p in self.portfolios.items():
-                    orders = self._build_orders(name, p, signals, prices, date)
-                    p.pending = self._sell_first(orders)
-                    if orders:
-                        buys = [o["symbol"] for o in orders if o["side"] == "buy"]
-                        sells = [o["symbol"] for o in orders if o["side"] == "sell"]
-                        parts = []
-                        if sells:
-                            parts.append(f"賣出 {len(sells)} 檔（{'、'.join(sells[:4])}）")
-                        if buys:
-                            parts.append(f"買進 {len(buys)} 檔（{'、'.join(buys[:4])}）")
-                        print(f"      {name:18s} 明日 {'，'.join(parts)}")
-                    else:
-                        print(f"      {name:18s} 明日無新單")
+                todo = list(self.portfolios.items())
+
+            for name, p in todo:
+                orders = self._build_orders(name, p, signals, prices, date, trailing)
+                p.pending = self._sell_first(orders)
+                if orders:
+                    buys = [o["symbol"] for o in orders if o["side"] == "buy"]
+                    sells = [o["symbol"] for o in orders if o["side"] == "sell"]
+                    parts = []
+                    if sells:
+                        parts.append(f"賣出 {len(sells)} 檔（{'、'.join(sells[:4])}）")
+                    if buys:
+                        parts.append(f"買進 {len(buys)} 檔（{'、'.join(buys[:4])}）")
+                    print(f"      {name:18s} 明日 {'，'.join(parts)}")
+                else:
+                    print(f"      {name:18s} 明日無新單")
 
         self.state["processed_dates"].append(str(date))
 
@@ -696,9 +790,18 @@ class Simulator:
                        prices: dict) -> int:
         """依上限與現有權益決定買幾股。支援零股。"""
         equity = p.equity(prices, field="open") or self.state["initial_capital"]
+        # max_position_pct 是「單一個股」的集中度上限，目的是分散個股風險。
+        # 買進持有型持有的是 ETF，本身就是一籃子股票，套用這個上限只會讓
+        # 它變成「25% 大盤 + 75% 現金」——那是另一種資產配置，不再是
+        # 「你不如直接買大盤」的對照組，比出來的結論會整個錯掉。
+        # 這個上限原本只寫在 _build_orders 的預算裡，這裡又蓋回去了。
+        if p.name in BUY_HOLD_STRATEGIES:
+            cap = equity
+        else:
+            cap = equity * self.cfg["max_position_pct"]
         target_amount = min(
-            equity * self.cfg["max_position_pct"],
-            order.get("budget", equity * self.cfg["max_position_pct"]),
+            cap,
+            order.get("budget", cap),
             p.cash * 0.995,   # 留一點緩衝給手續費
         )
         if target_amount <= 0:
@@ -753,12 +856,13 @@ class Simulator:
         return stopped
 
     def _build_orders(self, strategy: str, p: Portfolio, signals: pd.DataFrame,
-                      prices: dict, today: dt.date) -> list[dict]:
+                      prices: dict, today: dt.date,
+                      trailing: dict[str, float] | None = None) -> list[dict]:
         """
         產生明日的委託單。賣單排在買單前面，撮合時先賣後買，
         讓換股釋放出來的現金當天就能用。
         """
-        targets = pick_targets(strategy, signals, self.cfg["top_n"])
+        targets = pick_targets(strategy, signals, self.cfg["top_n"], trailing)
         exits = pick_exits(
             strategy, signals, p.positions, targets,
             holding_days_for(strategy, self.cfg["max_holding_days"]), today,

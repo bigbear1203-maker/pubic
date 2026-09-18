@@ -256,8 +256,162 @@ def test_limit_fill_behaviour(m):
               all(v <= 100.0 + 1e-9 for v in fills.values()), str(fills))
 
 
+def _write_history(path, rows):
+    cols = ["股票代碼", "股價日期(資料基準日)", "目前股價", "綜合分數",
+            "執行時間", "預測目標日(隔日估計)", "ATR",
+            "外資買賣超佔當日成交量比重(%)"]
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    df[cols].to_excel(path, index=False, sheet_name="分析紀錄")
+
+
+def test_trailing_returns(m):
+    print("\n[9] 近 N 日報酬：只能用過去，不能碰未來")
+    with tempfile.TemporaryDirectory() as td:
+        log = Path(td) / "stock_analysis_log_v3.7.xlsx"
+        rows = []
+        # A 從 100 一路跌到 90；B 從 100 一路漲到 110
+        prices = {"A.TW": [100, 98, 96, 94, 92, 90],
+                  "B.TW": [100, 102, 104, 106, 108, 110]}
+        days = [dt.date(2026, 9, 7) + dt.timedelta(days=i) for i in range(6)]
+        for sym, series in prices.items():
+            for d, px in zip(days, series):
+                rows.append({"股票代碼": sym,
+                             "股價日期(資料基準日)": d.isoformat(),
+                             "目前股價": px, "綜合分數": 3})
+        _write_history(log, rows)
+
+        tr = m.trailing_returns(log, days[-1], lookback=5)
+        check("A 近 5 日 -10%", abs(tr["A.TW"] - (-10.0)) < 1e-9, str(tr))
+        check("B 近 5 日 +10%", abs(tr["B.TW"] - 10.0) < 1e-9, str(tr))
+
+        # 基準日往前挪，結果必須跟著變小——證明沒有偷看未來
+        mid = m.trailing_returns(log, days[2], lookback=5)
+        check("基準日 = 第 3 天時，A 只算得到 -4%（沒有偷看後面）",
+              abs(mid["A.TW"] - (-4.0)) < 1e-9, str(mid))
+        check("基準日 = 第 3 天時，B 只算得到 +4%",
+              abs(mid["B.TW"] - 4.0) < 1e-9, str(mid))
+
+        # 觀測點太少不給數字
+        few = m.trailing_returns(log, days[1], lookback=5)
+        check(f"只有 2 個觀測點時不回傳（門檻 {m.REVERSAL_MIN_OBS}）",
+              few == {}, str(few))
+
+        check("紀錄檔不存在時回傳空 dict 而不是炸掉",
+              m.trailing_returns(Path(td) / "無.xlsx", days[-1]) == {})
+
+
+def test_reversal_strategy(m):
+    print("\n[10] reversal_topn：買跌最多的，與 score_topn 反向")
+    sig = pd.DataFrame([
+        {"股票代碼": "A.TW", "綜合分數": 1},
+        {"股票代碼": "B.TW", "綜合分數": 9},
+        {"股票代碼": "C.TW", "綜合分數": 5},
+        {"股票代碼": "D.TW", "綜合分數": 7},
+    ])
+    trailing = {"A.TW": -8.0, "B.TW": +6.0, "C.TW": -3.0, "D.TW": +1.0}
+    got = m.pick_targets("reversal_topn", sig, 2, trailing)
+    check("選出跌最多的兩檔 A、C",
+          [x[0] for x in got] == ["A.TW", "C.TW"], str(got))
+    check("理由帶出報酬數字", "-8.0%" in got[0][1], str(got[0]))
+
+    base = m.pick_targets("score_topn", sig, 2)
+    check("score_topn 選的是分數最高的 B、D",
+          [x[0] for x in base] == ["B.TW", "D.TW"], str(base))
+    check("兩者選出的股票完全不重疊（確認方向真的相反）",
+          not ({x[0] for x in got} & {x[0] for x in base}))
+
+    check("沒有回看報酬時不選股（寧可不出手）",
+          m.pick_targets("reversal_topn", sig, 2, {}) == [])
+    check("回看報酬是 None 時也不選",
+          m.pick_targets("reversal_topn", sig, 2, None) == [])
+    partial = m.pick_targets("reversal_topn", sig, 3, {"C.TW": -3.0})
+    check("只有部分標的算得出報酬時，只從那些裡面挑",
+          [x[0] for x in partial] == ["C.TW"], str(partial))
+
+
+def test_foreign_flow(m):
+    print("\n[11] foreign_flow：跟隨外資買超")
+    col = "外資買賣超佔當日成交量比重(%)"
+    sig = pd.DataFrame([
+        {"股票代碼": "A.TW", "綜合分數": 1, col: 2.5},
+        {"股票代碼": "B.TW", "綜合分數": 9, col: -4.0},
+        {"股票代碼": "C.TW", "綜合分數": 5, col: 8.1},
+        {"股票代碼": "D.TW", "綜合分數": 7, col: None},
+    ])
+    got = m.pick_targets("foreign_flow", sig, 3)
+    check("依外資買超佔量由高到低選 C、A",
+          [x[0] for x in got] == ["C.TW", "A.TW"], str(got))
+    check("外資賣超的 B 不選（只跟買超）",
+          all(x[0] != "B.TW" for x in got))
+    check("欄位是空值的 D 不選", all(x[0] != "D.TW" for x in got))
+    check("缺整個欄位時回空，不炸掉",
+          m.pick_targets("foreign_flow", sig.drop(columns=[col]), 3) == [])
+
+
+def test_etf_end_to_end(m):
+    print("\n[12] etf_hold 端到端：買一次，然後全程不動")
+    syms = ["2300.TW", "2301.TW"]
+    days = [dt.date(2026, 9, 14) + dt.timedelta(days=i) for i in range(5)]
+    days = [d for d in days if d.weekday() < 5]
+    cols = ["股票代碼", "綜合分數", "目前股價", "ATR", "執行時間",
+            "股價日期(資料基準日)", "預測目標日(隔日估計)"]
+    rows, px = [], []
+    for i, d in enumerate(days):
+        for j, sym in enumerate(syms):
+            rows.append({"股票代碼": sym, "綜合分數": 5 - j, "目前股價": 100.0,
+                         "ATR": 2.5,
+                         "執行時間": dt.datetime.combine(d, dt.time(15, 10)),
+                         "股價日期(資料基準日)": d.isoformat(),
+                         "預測目標日(隔日估計)": d.isoformat()})
+            px.append({"date": d.isoformat(), "symbol": sym,
+                       "open": 100.0, "close": 100.0})
+        # 0050 一路漲：最後權益要看得出來
+        px.append({"date": d.isoformat(), "symbol": m.ETF_SYMBOL,
+                   "open": 100.0 + i * 2, "close": 100.0 + i * 2})
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        log = td / "stock_analysis_log_v3.7.xlsx"
+        pd.DataFrame(rows)[cols].to_excel(log, index=False, sheet_name="分析紀錄")
+        pf = td / "px.csv"
+        pd.DataFrame(px).to_csv(pf, index=False)
+        state = td / "s.json"
+        m.main(["init", "--state", str(state), "--capital", "1000000",
+                "--top-n", "2"])
+        for d in days:
+            m.main(["step", "--state", str(state), "--date", d.isoformat(),
+                    "--log", str(log), "--offline-prices", str(pf)])
+        sim = m.Simulator.load(state)
+        etf = sim.portfolios["etf_hold"]
+
+        buys = [t for t in etf.trades if t["side"] == "買進"]
+        sells = [t for t in etf.trades if t["side"] == "賣出"]
+        check("etf_hold 有買進", len(buys) >= 1, str(etf.trades))
+        check("買的是 0050", all(t["symbol"] == m.ETF_SYMBOL for t in buys))
+        check("全程沒有賣出（買進持有）", len(sells) == 0, str(sells))
+        check("只買一次，不重複加碼", len(buys) == 1, f"{len(buys)} 次")
+        check("持股只有 0050 一檔", list(etf.positions) == [m.ETF_SYMBOL],
+              str(list(etf.positions)))
+
+        # 單一部位不該被 max_position_pct=25% 限制住
+        cost = buys[0]["amount"]
+        check("資金大部分投入（不受單檔 25% 上限限制）",
+              cost > 1_000_000 * 0.9, f"投入 {cost:,.0f}")
+
+        s = sim.summary()
+        ret = float(s[s["策略"] == "etf_hold"]["報酬率(%)"].iloc[0])
+        check("0050 上漲時 etf_hold 報酬為正", ret > 0, f"{ret:.2f}%")
+
+        cash_ret = float(s[s["策略"] == "cash"]["報酬率(%)"].iloc[0])
+        check("且贏過 cash（這正是它存在的意義）", ret > cash_ret,
+              f"etf {ret:.2f}% vs cash {cash_ret:.2f}%")
+
+
 def test_backward_compat(m):
-    print("\n[8] 舊 state.json 自動補上新策略（不必重開一輪）")
+    print("\n[13] 舊 state.json 自動補上新策略（不必重開一輪）")
     old_state = {
         "version": 1, "created": "2026-09-01T00:00:00",
         "initial_capital": 1000000.0,
@@ -280,8 +434,10 @@ def test_backward_compat(m):
         sim = m.Simulator.load(p)
         check("舊策略的歷史沒有被動到",
               len(sim.portfolios["score_topn"].equity_curve) == 1)
-        check("新策略被補上",
-              set(sim.newly_added) == {"score_lowturn", "score_limit", "etf_hold"},
+        legacy = {"strategy_decision", "ev_decision", "score_topn",
+                  "prob_topn", "active_equal", "cash"}
+        check("新策略被補上（舊檔沒有的那些）",
+              set(sim.newly_added) == set(m.STRATEGIES) - legacy,
               str(sim.newly_added))
         check("新策略從全額現金起跑",
               all(sim.portfolios[n].cash == 1000000.0 for n in sim.newly_added))
@@ -317,6 +473,10 @@ def main():
     test_buyhold_never_exits(m)
     test_limit_orders(m)
     test_limit_fill_behaviour(m)
+    test_trailing_returns(m)
+    test_reversal_strategy(m)
+    test_foreign_flow(m)
+    test_etf_end_to_end(m)
     test_backward_compat(m)
     print("\n" + "=" * 64)
     print(f"  通過 {_passed} 項 / 失敗 {_failed} 項")
