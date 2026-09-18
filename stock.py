@@ -16,6 +16,7 @@
     python stock.py audit      稽核欄位是否重複或無用（不改檔案）
     python stock.py merge      把 Excel 寫入失敗時的 CSV 備援併回主紀錄
     python stock.py events     事件日曆：哪幾天不適合開新倉
+    python stock.py evaluate   獲利能力評估：四道關卡，該不該下真錢
     python stock.py check      環境自檢：套件、檔案、版本、設定
     python stock.py archive    把舊版程式移到 舊版/ 資料夾
 
@@ -44,7 +45,7 @@ CURRENT = {
     "整合流程": ["tw_stock_pipeline_v1.1.py"],
     "工具": ["paper_trading.py", "log_review.py", "compare_predictors.py",
              "repair_log.py", "add_action_column.py", "merge_fallback.py",
-             "event_calendar.py"],
+             "event_calendar.py", "evaluate.py"],
 }
 
 OBSOLETE_PATTERNS = [
@@ -302,6 +303,7 @@ def cmd_overview() -> int:
     print("    audit    稽核欄位是否重複或無用")
     print("    merge    把 CSV 備援併回主紀錄")
     print("    events   事件日曆（--stats 比較事件日與一般日）")
+    print("    evaluate 獲利能力評估：四道關卡")
     print("    archive  把舊版程式移到 舊版/")
     print("    sim-init 重新建立一輪模擬")
     print("\n  設定集中在 stock_settings.json，改那一個檔案就好。")
@@ -371,6 +373,10 @@ def main(argv=None) -> int:
 
     if cmd == "events":
         return run("event_calendar.py", extra)
+    if cmd == "evaluate":
+        # 不先檢查紀錄檔存不存在——evaluate 自己會找，而且缺哪個檔就
+        # 跳過哪一關，不是全有全無。
+        return run("evaluate.py", extra)
 
     log = find_log()
     if cmd in ("review", "repair", "advice") and log is None:

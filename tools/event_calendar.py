@@ -502,7 +502,12 @@ def event_stats(log_path: Path, cal: TradingCalendar) -> int:
 
     print(f"\n讀取紀錄檔：{log_path.name}")
     try:
-        df = pd.read_excel(log_path)
+        # 指名工作表，不靠「預設讀第一張」——其他工具都是這樣讀的，
+        # 而 log_review 會在活頁簿裡寫入額外的工作表。
+        try:
+            df = pd.read_excel(log_path, sheet_name="分析紀錄")
+        except ValueError:
+            df = pd.read_excel(log_path)
     except Exception as e:                                      # noqa: BLE001
         print(f"✗ 讀取失敗：{type(e).__name__}: {e}")
         return 1
