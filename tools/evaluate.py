@@ -373,13 +373,28 @@ def gate4_execution(sim, trades: pd.DataFrame, df: pd.DataFrame) -> list[str]:
     if not trades.empty:
         same_day = _same_day_stops(trades)
         if same_day:
-            issues.append(f"有 {len(same_day)} 筆在進場當天就停損出場")
-            print(f"  ✗ 進場當天就停損：{len(same_day)} 筆")
+            # 當天進當天停損不一定是 bug。設定的停損是 -stop_loss_pct，
+            # 標的當天就跌破那條線，出場就是正確行為。
+            # 真正的 bug 長相不同：虧損幅度離設定值很遠（例如 -0.5% 或
+            # 甚至還在賺的時候就被掃出場），那才代表停損價算錯了基準。
+            pct = float(sim.cfg.get("stop_loss_pct", 0.07)) * 100
+            losses = [abs(float(t.get("報酬率(%)", 0) or 0)) for t in same_day]
+            suspicious = [t for t, L in zip(same_day, losses) if L < pct * 0.7]
+            print(f"  · 進場當天就停損：{len(same_day)} 筆"
+                  f"（停損設定 -{pct:.0f}%）")
             for t in same_day[:5]:
+                r = t.get("報酬率(%)", float("nan"))
+                tag = "  ← 可疑" if abs(float(r or 0)) < pct * 0.7 else ""
                 print(f"      {t['策略']:18s} {t['symbol']:10s} {t['date']}  "
-                      f"{t.get('報酬率(%)', float('nan')):+.2f}%")
-            print("      → 停損價可能又是用訊號價而非成交價算的，"
-                  "或停損倍數對這些標的太緊")
+                      f"{r:+.2f}%{tag}")
+            if suspicious:
+                issues.append(
+                    f"{len(suspicious)} 筆停損的虧損幅度遠小於設定的 -{pct:.0f}%")
+                print("      ✗ 有幾筆的虧損幅度離設定值太遠——"
+                      "停損價可能又是用訊號價而非成交價算的")
+            else:
+                print(f"      → 虧損幅度都接近或超過設定的 -{pct:.0f}%，"
+                      "屬於標的當天急跌，不是停損價算錯")
         else:
             print("  ✓ 沒有進場當天就停損的部位")
 
@@ -413,6 +428,19 @@ def gate4_execution(sim, trades: pd.DataFrame, df: pd.DataFrame) -> list[str]:
                 r = pd.to_numeric(g.get("報酬率(%)"), errors="coerce").dropna()
                 avg = f"{r.mean():+.2f}%" if len(r) else "—"
                 print(f"      {reason:28s} {len(g):>4d} 筆   平均 {avg}")
+            stops = sells[sells["_reason"].str.contains("停損")]
+            if not stops.empty:
+                sr = pd.to_numeric(stops.get("報酬率(%)"), errors="coerce").dropna()
+                want = -float(sim.cfg.get("stop_loss_pct", 0.07)) * 100
+                if len(sr) >= 3 and sr.mean() < want - 1.0:
+                    issues.append(
+                        f"停損實際出場 {sr.mean():.2f}%，比設定的 {want:.0f}% 差"
+                        f"{abs(sr.mean() - want):.1f} 個百分點（跳空穿價）")
+                    print(f"\n      ✗ 停損設定 {want:.0f}%，實際平均出場 {sr.mean():.2f}%")
+                    print(f"        差 {abs(sr.mean() - want):.1f} 個百分點——"
+                          "停損是用收盤價檢查的，跳空的部分停不住。")
+                    print("        這不是設定錯，是日 K 停損的固有限制："
+                          "價格跳過停損線時，你只能在更低的地方出場。")
             stop_share = sells["_reason"].str.contains("停損").mean()
             if stop_share > 0.5:
                 issues.append(f"停損出場佔 {stop_share * 100:.0f}%，停損可能設太緊")
