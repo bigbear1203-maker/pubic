@@ -58,10 +58,14 @@ def load_schema() -> list[str]:
 
 def inspect(path: Path, schema: list[str]) -> dict:
     import openpyxl
+    # read_only 模式會一直握著檔案控制代碼。中途出錯也一定要關，否則在
+    # Windows 上紀錄檔會被鎖住：Excel 打不開、分析程式也寫不進去。
     wb = openpyxl.load_workbook(path, read_only=True)
-    ws = wb[SHEET] if SHEET in wb.sheetnames else wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    wb.close()
+    try:
+        ws = wb[SHEET] if SHEET in wb.sheetnames else wb.active
+        rows = list(ws.iter_rows(values_only=True))
+    finally:
+        wb.close()
     if not rows:
         return {"ok": False, "reason": "檔案是空的"}
 

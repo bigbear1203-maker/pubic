@@ -180,7 +180,9 @@ def main():
         out = Path(td) / "rep.xlsx"
         m.main(["report", "--state", str(state), "-o", str(out)])
         check("報告 Excel 產生成功", out.exists())
-        sheets = pd.ExcelFile(out).sheet_names
+        # 用 with 關檔：Windows 不能刪除還開著的檔案（Linux 上測不出來）
+        with pd.ExcelFile(out) as xf:
+            sheets = xf.sheet_names
         check("報告含策略績效/交易明細/每日權益",
               all(x in sheets for x in ["策略績效", "每日權益", "模擬參數"]), str(sheets))
 

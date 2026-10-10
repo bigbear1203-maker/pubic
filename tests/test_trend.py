@@ -283,7 +283,10 @@ def test_screen_end_to_end():
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "趨勢股篩選結果_test.xlsx"
         ts.save(res, out)
-        sheets = pd.ExcelFile(out).sheet_names
+        # 一定要用 with 關檔：Windows 不能刪除還開著的檔案，
+        # 暫存資料夾清理時會 PermissionError（Linux 上測不出來）。
+        with pd.ExcelFile(out) as xf:
+            sheets = xf.sheet_names
         check("輸出含「入選名單」與「全部候選」兩張表",
               "入選名單" in sheets and "全部候選與未入選原因" in sheets, str(sheets))
         back = pd.read_excel(out, sheet_name="入選名單")
