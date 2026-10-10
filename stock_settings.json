@@ -32,5 +32,22 @@
     "max_holding_days": 10,
     "allow_odd_lot": true,
     "_allow_odd_lot_註": "允許零股。設為 false 則只買整張，但 100 萬買不起一張台積電"
+  },
+
+  "趨勢股篩選": {
+    "_註": "持續上漲股篩選（tools/trend_screener.py）。窗口長度照文獻慣例設定，請不要用自己幾個月的模擬結果去調這幾個數字——那就是過擬合。",
+    "skip_days": 21,
+    "_skip_days_註": "跳過最近 21 個交易日不納入計算：台股短期反轉明顯，剛暴漲的不追",
+    "formation_days": 126,
+    "_formation_days_註": "形成期約 6 個月。前一期也用同樣長度，用來判斷是不是『持續』上漲",
+    "top_fraction": 0.3,
+    "_top_fraction_註": "形成期報酬排在前 30% 才算贏家",
+    "min_avg_turnover": 20000000,
+    "_min_avg_turnover_註": "20 日平均成交額下限（元）。太冷門的股票模擬成交不實際",
+    "max_recent_spike": 0.25,
+    "_max_recent_spike_註": "最近一個月已漲超過 25% 的不買，避開短期反轉",
+    "top_n": 5,
+    "prefilter_n": 400,
+    "_prefilter_n_註": "先依成交額取前 400 檔再下載歷史，太多會被限流"
   }
 }

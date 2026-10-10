@@ -6,6 +6,8 @@
 
 流程：
     Step 1：活躍股篩選（tw_active_stocks_predictor v2.1）→ TOP_N_ACTIVE 檔
+    Step 1b：持續上漲股篩選（tools/trend_screener.py，選用）→ 給 trend_persistent
+             用同一份全市場清單，改以「連續穩定上漲」挑選；失敗不影響其他步驟
     Step 2：逐檔完整分析（claude_stock_analyzer v3.7）→ 寫入長期記錄 Excel
     Step 3：紙上交易模擬推進一天（tools/paper_trading.py）★ v1.1 新增
     Step 4：回填前一日的實際結果（tools/log_review.py）    ★ v1.1 新增
@@ -93,6 +95,8 @@ PREDICTOR_SCRIPT = _find_predictor()
 ANALYZER_SCRIPT = _find("claude_stock_analyzer_v3.7.py")
 PAPER_TRADING = _find("paper_trading.py")
 LOG_REVIEW = _find("log_review.py")
+# 選用：持續上漲股篩選。找不到就跳過，不影響其他步驟。
+TREND_SCREENER = _find("trend_screener.py")
 
 # analyzer v3.7 的紀錄檔：若目錄下已有 v3.6 建立的 stock_analysis_log.xlsx，
 # v3.7 會因欄位不一致而自動另存 stock_analysis_log_v3.7.xlsx；
@@ -145,6 +149,40 @@ def _run_tool(script: Path, args: list[str], label: str) -> bool:
     except Exception as e:
         print(f"  ⚠ {label}執行失敗：{type(e).__name__}: {e}")
         return False
+
+
+def run_trend_screen(universe, today: datetime.date):
+    """
+    執行持續上漲股篩選，回傳輸出檔路徑；任何失敗都回傳 None 而不中斷流程。
+
+    這一步是附加的。它掛掉的代價應該是「今天趨勢策略不調整」，
+    不是「今天整條流程都沒跑」——後者會讓其他十個策略也缺一天資料。
+    """
+    print(f"\n{'='*64}")
+    print("Step 1b：持續上漲股篩選（全市場，非活躍股）")
+    print(f"{'='*64}")
+    if not TREND_SCREENER.exists():
+        print("  （找不到 trend_screener.py，略過。trend_persistent 策略不會有動作）")
+        return None
+    try:
+        ts = _load_module(TREND_SCREENER, "trend_screener")
+        pool = ts.prefilter(universe)
+        names = dict(zip(pool["stock_id"].astype(str), pool["stock_name"]))
+        print(f"  依成交額先取前 {len(pool)} 檔，下載約 15 個月歷史（約需 1~3 分鐘）...")
+        hist = ts.download_history(pool["stock_id"].astype(str).tolist())
+        print(f"  成功取得 {len(hist)} 檔")
+        result = ts.screen(hist, names)
+        if result.empty:
+            print("  ⚠ 沒有可用的歷史資料，略過")
+            return None
+        ts.print_result(result, ts.TOP_N)
+        out = SCRIPT_DIR / f"趨勢股篩選結果_{today.isoformat()}.xlsx"
+        ts.save(result, out)
+        print(f"\n  趨勢篩選結果已另存：{out.name}")
+        return out
+    except Exception as e:                                         # noqa: BLE001
+        print(f"  ⚠ 趨勢篩選失敗，略過（其他步驟照常）：{type(e).__name__}: {e}")
+        return None
 
 
 def main():
@@ -228,6 +266,18 @@ def main():
     print(f"\n篩選結果已另存：{screen_output}")
 
     # ------------------------------------------------------------
+    # Step 1b：持續上漲股篩選（選用）
+    # ------------------------------------------------------------
+    # 活躍度排名本來就已經對「全部」普通股算過一次（predicted），
+    # 只是以前只取前 10 名就丟掉了。這裡拿同一份全市場清單，改用
+    # 「連續穩定上漲」的標準重新挑一次，給 trend_persistent 策略用。
+    #
+    # 刻意「不」把這些股票加進 Step 2 的分析清單：那會改變其他策略的
+    # 選股池，讓已經跑了好幾週的對照實驗前後不可比。趨勢策略自己的
+    # 價格與 ATR 由篩選器提供，不需要分析程式。
+    trend_output = run_trend_screen(predicted, today)
+
+    # ------------------------------------------------------------
     # Step 2：逐檔完整分析
     # ------------------------------------------------------------
     tickers = [f"{sid}.TW" for sid in top_active["stock_id"].tolist()]
@@ -262,9 +312,11 @@ def main():
                                   "--capital", "1000000"], "模擬初始化")
 
     sim_cmd = "settle" if is_settle else "step"
-    _run_tool(PAPER_TRADING, [sim_cmd, "--state", str(SIM_STATE),
-                              "--date", today.isoformat(),
-                              "--log", str(log_path)], "紙上交易模擬")
+    sim_args = [sim_cmd, "--state", str(SIM_STATE),
+                "--date", today.isoformat(), "--log", str(log_path)]
+    if trend_output is not None:
+        sim_args += ["--trend-file", str(trend_output)]
+    _run_tool(PAPER_TRADING, sim_args, "紙上交易模擬")
 
     # 每週五拍一張快照存檔。不出清部位——出清只在 --settle 時才做，
     # 這樣週報之間才有可比較的連續性。

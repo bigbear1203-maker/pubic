@@ -139,10 +139,15 @@ STRATEGIES = ("strategy_decision", "ev_decision", "score_topn",
               # v1.2 變體對照組：每一個只改 score_topn 的「一個」變數，
               # 這樣哪個改動有效才歸因得清楚。同時改兩件事就分不出是誰的功勞。
               "score_lowturn", "score_limit", "etf_hold",
-              # v1.3 實證導向：台股是動量效應的著名例外，短期反轉才是
-              # 文獻上被反覆記錄的現象。現行的 score_topn / prob_topn
-              # 本質上都在買「剛剛表現好的」，方向正好相反。
-              "reversal_topn", "foreign_flow")
+              # v1.3 實證導向：「一般」動量在台股不顯著，短期反轉才是文獻上
+              # 被反覆記錄的現象。現行的 score_topn / prob_topn 本質上都在買
+              # 「剛剛表現好的」，方向正好相反。
+              # （v1.4 更正：不是所有動量都無效。「持續」上漲的那一類在台股
+              #   有顯著中期報酬，見 trend_persistent 與 tools/trend_screener.py。）
+              "reversal_topn", "foreign_flow",
+              # v1.4 持續上漲：選股池不是活躍股，而是 trend_screener 從全市場
+              # 挑出的「連續穩定上漲」股票。每月才調整一次。
+              "trend_persistent")
 
 # 排名型策略：規則是「持有當下的前 N 名」，所以跌出名單就換掉。
 RANKING_STRATEGIES = ("score_topn", "prob_topn", "active_equal",
@@ -154,6 +159,10 @@ SIGNAL_STRATEGIES = ("strategy_decision", "ev_decision")
 # 買進持有型：不換股、不停損、不受最長持有天數限制。
 # 唯一的意義是回答「你不如直接買大盤」這個問題。
 BUY_HOLD_STRATEGIES = ("etf_hold",)
+# 每月調整型：只在每月第一次有趨勢名單的交易日換股，其餘日子只檢查停損。
+# 文獻上「持續上漲」的超額報酬是中期（數個月）持有得到的，每天換股會讓
+# 0.471% 的來回成本把它吃光——實測每日換股的策略年化成本已達 55.7%。
+MONTHLY_STRATEGIES = ("trend_persistent",)
 
 # --- 變體參數（實測依據見 docs/操作總覽.md）-----------------------------
 # 實測：15 個交易日、41~45 次買進、年化交易成本 55.7%。周轉是最大的
@@ -187,6 +196,7 @@ STRATEGY_DESC = {
     "reversal_topn": f"買近 {REVERSAL_LOOKBACK_DAYS} 日跌最多的前 N 名"
                      "（台股短期反轉，與 score_topn 方向相反）",
     "foreign_flow": "外資買賣超佔成交量比重最高的前 N 名（跟隨法人）",
+    "trend_persistent": "全市場持續上漲前 N 名，每月調整一次（選股池不同於活躍股）",
 }
 
 
@@ -357,6 +367,40 @@ class Portfolio:
 # 選股規則
 # ============================================================
 
+def load_trend_file(path: Path | None) -> pd.DataFrame:
+    """
+    讀 trend_screener 的輸出，只取「入選名單」。
+
+    回傳欄位：股票代碼（已補上 .TW）、排名、收盤價、ATR。
+    檔案不存在、讀不到、或今天沒有任何入選，一律回傳空表——
+    trend_persistent 會因此不調整，等下一個有名單的交易日再做，
+    而不是用一份過期或殘缺的名單硬換股。
+    """
+    cols = ["股票代碼", "排名", "收盤價", "ATR"]
+    if path is None or not Path(path).exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_excel(path, sheet_name="入選名單")
+    except Exception as e:                                         # noqa: BLE001
+        print(f"  ⚠ 讀不到趨勢名單 {Path(path).name}：{type(e).__name__}: {e}")
+        return pd.DataFrame(columns=cols)
+    if df.empty or "股票代碼" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    def _sym(x):
+        t = str(x).strip()
+        if t.endswith(".0"):            # Excel 會把 2330 讀成 2330.0
+            t = t[:-2]
+        return t if "." in t else f"{t}.TW"
+
+    df = df.copy()
+    df["股票代碼"] = df["股票代碼"].map(_sym)
+    for c in ("排名", "收盤價", "ATR"):
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[cols].sort_values("排名").reset_index(drop=True)
+
+
 def trailing_returns(log_path: Path, basis_date: dt.date,
                      lookback: int = REVERSAL_LOOKBACK_DAYS) -> dict[str, float]:
     """
@@ -423,7 +467,8 @@ def _clean_signals(log_path: Path, basis_date: dt.date) -> pd.DataFrame:
 
 
 def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int,
-                 trailing: dict[str, float] | None = None) -> list[tuple[str, str]]:
+                 trailing: dict[str, float] | None = None,
+                 trend: pd.DataFrame | None = None) -> list[tuple[str, str]]:
     """
     回傳 [(symbol, 理由), ...]。cash 策略永遠回傳空清單。
 
@@ -436,6 +481,14 @@ def pick_targets(strategy: str, signals: pd.DataFrame, top_n: int,
     # 或當天沒有訊號時，大盤對照組還是該照買。
     if strategy == "etf_hold":
         return [(ETF_SYMBOL, f"買進並持有 {ETF_SYMBOL}（大盤對照組）")]
+
+    # 趨勢策略的選股池是 trend_screener 的名單，不是活躍股訊號，
+    # 所以要擋在 signals.empty 之前。
+    if strategy == "trend_persistent":
+        if trend is None or trend.empty:
+            return []
+        return [(r["股票代碼"], f"持續上漲第 {int(r['排名'])} 名")
+                for _, r in trend.head(top_n).iterrows()]
 
     if signals.empty:
         return []
@@ -561,8 +614,12 @@ def pick_exits(strategy: str, signals: pd.DataFrame, positions: dict,
     if strategy in BUY_HOLD_STRATEGIES:
         return exits
 
+    # 每月調整型只在調整日走到這裡，持有到下次調整是它的規則。
+    # 套用 10 天的時間停損會讓它被迫每兩週換一次，那就不是月調整了。
+    skip_time_stop = strategy in MONTHLY_STRATEGIES
+
     # 1. 時間停損（其餘策略共用）
-    for sym, pos in positions.items():
+    for sym, pos in ([] if skip_time_stop else positions.items()):
         try:
             held = (today - dt.date.fromisoformat(str(pos["entry_date"]))).days
         except (ValueError, TypeError):
@@ -570,11 +627,15 @@ def pick_exits(strategy: str, signals: pd.DataFrame, positions: dict,
         if held >= max_holding_days:
             exits[sym] = f"持有滿 {held} 天，時間停損"
 
-    if signals is None or signals.empty:
+    # 沒有活躍股訊號時，依賴訊號的策略無從判斷該賣什麼，只保留時間停損。
+    # 但每月調整型的出場依據是趨勢名單（targets），不是活躍股訊號——
+    # 不能在這裡就提早回傳，否則那天掉出名單的股票永遠不會被賣掉，
+    # 新股票照買，持股就會超過 top_n（跟先前「買 7 賣 0」是同一類錯誤）。
+    if (signals is None or signals.empty) and strategy not in MONTHLY_STRATEGIES:
         return exits
 
     # 2. 排名型：跌出名單就換股
-    if strategy in RANKING_STRATEGIES:
+    if strategy in RANKING_STRATEGIES or strategy in MONTHLY_STRATEGIES:
         # keep 非空時用它（低周轉變體的寬名次帶），否則就是今日目標。
         tgt = set(keep) if keep else {sym for sym, _ in targets}
         label = (f"已跌出前 {len(tgt)} 名，換股" if keep
@@ -657,7 +718,8 @@ class Simulator:
     # ---------- 每日流程 ----------
     def step(self, date: dt.date, log_path: Path | None,
              offline_prices: pd.DataFrame | None = None,
-             settle: bool = False) -> None:
+             settle: bool = False,
+             trend: pd.DataFrame | None = None) -> None:
         """
         單一交易日的完整流程：
           1. 用今天的開盤價撮合昨天收盤後產生的單
@@ -754,22 +816,27 @@ class Simulator:
             # 近 N 日報酬只有反轉策略用得到，算一次給所有策略共用。
             trailing = (trailing_returns(log_path, date)
                         if log_path is not None and log_path.exists() else {})
+            trend = trend if trend is not None else pd.DataFrame()
             if signals.empty:
                 print("      ⚠ log 中找不到這一天的分析結果（資料基準日不符）。")
                 print("        請確認你已在收盤後執行過 claude_stock_analyzer_v3.7。")
                 # 買進持有型不看訊號，分析程式沒跑也該照常建立部位——
                 # 否則大盤對照組會因為「你那天忘了跑分析」而缺一段，
-                # 之後的比較就不公平了。
+                # 之後的比較就不公平了。趨勢策略看的是自己的名單，同理。
                 todo = [(n, p) for n, p in self.portfolios.items()
-                        if n in BUY_HOLD_STRATEGIES]
+                        if n in BUY_HOLD_STRATEGIES
+                        or (n in MONTHLY_STRATEGIES and not trend.empty)]
                 if todo:
-                    print(f"      （{len(todo)} 個買進持有策略不受影響，照常產生委託單）")
+                    print(f"      （{len(todo)} 個不依賴活躍股訊號的策略不受影響，照常處理）")
             else:
                 print(f"      可用訊號 {len(signals)} 檔")
                 todo = list(self.portfolios.items())
+            if not trend.empty:
+                print(f"      趨勢名單 {len(trend)} 檔")
 
             for name, p in todo:
-                orders = self._build_orders(name, p, signals, prices, date, trailing)
+                orders = self._build_orders(name, p, signals, prices, date,
+                                            trailing, trend)
                 p.pending = self._sell_first(orders)
                 if orders:
                     buys = [o["symbol"] for o in orders if o["side"] == "buy"]
@@ -855,14 +922,37 @@ class Simulator:
                 stopped += 1
         return stopped
 
+    def is_rebalance_day(self, strategy: str, today: dt.date,
+                         trend: pd.DataFrame | None) -> bool:
+        """
+        每月調整型今天該不該換股：這個月還沒調整過，而且今天有名單。
+
+        沒有名單的那天不算調整、也不記錄——明天有名單時會再試，
+        而不是讓整個月因為某天篩選失敗就被跳過。
+        """
+        if strategy not in MONTHLY_STRATEGIES:
+            return True
+        if trend is None or trend.empty:
+            return False
+        done = self.state.get("last_rebalance", {}).get(strategy)
+        return done != today.strftime("%Y-%m")
+
     def _build_orders(self, strategy: str, p: Portfolio, signals: pd.DataFrame,
                       prices: dict, today: dt.date,
-                      trailing: dict[str, float] | None = None) -> list[dict]:
+                      trailing: dict[str, float] | None = None,
+                      trend: pd.DataFrame | None = None) -> list[dict]:
         """
         產生明日的委託單。賣單排在買單前面，撮合時先賣後買，
         讓換股釋放出來的現金當天就能用。
         """
-        targets = pick_targets(strategy, signals, self.cfg["top_n"], trailing)
+        if strategy in MONTHLY_STRATEGIES:
+            if not self.is_rebalance_day(strategy, today, trend):
+                # 非調整日什麼都不做。停損由 _check_stops 照常處理，
+                # 被停損出場的空位留到下個月調整時再補。
+                return []
+            self.state.setdefault("last_rebalance", {})[strategy] = today.strftime("%Y-%m")
+
+        targets = pick_targets(strategy, signals, self.cfg["top_n"], trailing, trend)
         exits = pick_exits(
             strategy, signals, p.positions, targets,
             holding_days_for(strategy, self.cfg["max_holding_days"]), today,
@@ -911,6 +1001,11 @@ class Simulator:
                                signals.get("ATR", pd.Series(dtype=float))))
             px_map = dict(zip(signals["股票代碼"],
                               signals.get("目前股價", pd.Series(dtype=float))))
+        # 趨勢名單的股票多半不在活躍股訊號裡，ATR 要從名單本身拿，
+        # 否則停損只能退回固定百分比。
+        if strategy in MONTHLY_STRATEGIES and trend is not None and not trend.empty:
+            atr_map.update(dict(zip(trend["股票代碼"], trend["ATR"])))
+            px_map.update(dict(zip(trend["股票代碼"], trend["收盤價"])))
         for sym, reason in targets:
             atr = atr_map.get(sym)
             order = {
@@ -1263,6 +1358,8 @@ def main(argv=None) -> int:
         pp.add_argument("--log", type=Path, default=Path("stock_analysis_log_v3.7.xlsx"))
         pp.add_argument("--offline-prices", type=Path, default=None,
                         help="測試用：含 date/symbol/open/close 的 CSV")
+        pp.add_argument("--trend-file", type=Path, default=None,
+                        help="trend_screener 的輸出（趨勢股篩選結果_日期.xlsx）")
         _add_state(pp)
 
     p_rep = sub.add_parser("report", help="輸出結算報告")
@@ -1314,7 +1411,11 @@ def main(argv=None) -> int:
         log = args.log if args.log and args.log.exists() else None
         if log is None and args.cmd == "step":
             print(f"⚠ 找不到分析紀錄檔 {args.log}，本日只會撮合既有委託單、不產生新單。")
-        sim.step(date, log, offline, settle=(args.cmd == "settle"))
+        trend = load_trend_file(args.trend_file)
+        if args.trend_file and trend.empty:
+            print(f"⚠ 趨勢名單 {args.trend_file} 沒有入選股票或讀不到，"
+                  "trend_persistent 今天不調整。")
+        sim.step(date, log, offline, settle=(args.cmd == "settle"), trend=trend)
         sim.save(args.state)
         if args.cmd == "settle":
             print_report(sim)
