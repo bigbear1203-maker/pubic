@@ -498,13 +498,29 @@ def test_pipeline_resilience():
 
 def test_wiring():
     print("\n[13] 接線")
-    src = (ROOT / "stock.py").read_text(encoding="utf-8")
-    check("stock.py 有 trend 指令", 'cmd == "trend"' in src)
-    check("trend_screener.py 列在工具清單", '"trend_screener.py"' in src)
+    stock_py = ROOT / "stock.py"
+    src = stock_py.read_text(encoding="utf-8") if stock_py.exists() else ""
+    hint = f"檢查的是 {stock_py}，請把新版 stock.py 覆蓋到這裡"
+    check("stock.py 有 trend 指令", 'cmd == "trend"' in src, hint)
+    check("trend_screener.py 列在工具清單", '"trend_screener.py"' in src, hint)
+
+    # 設定檔的「趨勢股篩選」區塊是選用的：沒貼的話篩選器要退回內建預設值。
+    # 所以兩種情況都要能過，不能把「沒貼」當成錯誤，更不能因此崩潰。
     import json
-    cfg = json.loads((ROOT / "stock_settings.json").read_text(encoding="utf-8"))
-    check("設定檔有「趨勢股篩選」區塊", "趨勢股篩選" in cfg)
-    check("設定值有被篩選器讀到", ts.TOP_N == int(cfg["趨勢股篩選"]["top_n"]))
+    cfg_path = ROOT / "stock_settings.json"
+    cfg = (json.loads(cfg_path.read_text(encoding="utf-8"))
+           if cfg_path.exists() else {})
+    section = cfg.get("趨勢股篩選")
+    if section is None:
+        check("設定檔沒有「趨勢股篩選」區塊 → 使用內建預設值（21 / 126 / 30% / 5 檔）",
+              (ts.SKIP_DAYS, ts.FORMATION_DAYS, ts.TOP_FRACTION, ts.TOP_N)
+              == (21, 126, 0.30, 5),
+              f"{(ts.SKIP_DAYS, ts.FORMATION_DAYS, ts.TOP_FRACTION, ts.TOP_N)}")
+    else:
+        check("設定檔有「趨勢股篩選」區塊，且數值有被篩選器讀到",
+              ts.TOP_N == int(section.get("top_n", ts.TOP_N))
+              and ts.SKIP_DAYS == int(section.get("skip_days", ts.SKIP_DAYS)),
+              f"設定檔 top_n={section.get('top_n')}，篩選器讀到 {ts.TOP_N}")
 
 
 def main():
