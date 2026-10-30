@@ -406,6 +406,41 @@ def test_gate4_not_run_vs_no_issues():
               [l for l in out.splitlines() if "Gate 4" in l])
 
 
+def test_advice_comes_from_data():
+    """
+    回歸：結論段落原本寫死「降低周轉」「事件日不開新倉」等建議。
+    使用者兩個月的資料推翻了它們（低周轉輸原版 5.2 pp、事件日波動無差異），
+    工具卻每跑一次就再建議一次。建議必須來自資料。
+    """
+    print("\n[12] 結論不寫死建議，改為報告資料")
+    pt = load_pt()
+    sim = pt.Simulator.create(1_000_000, 5, 0.25, 0.07, 2.0, True, 0.6)
+    days = [f"2026-10-{d:02d}" for d in range(1, 31)]
+    for i, d in enumerate(days):
+        for name, eq, cash in (("score_topn", 1_000_000 + i * 1000, 10_000),
+                               ("score_lowturn", 1_000_000 - i * 1000, 10_000),
+                               ("score_limit", 1_000_000, 600_000)):
+            sim.portfolios[name].equity_curve.append(
+                {"date": d, "equity": eq, "cash": cash, "n_positions": 5})
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ev.final_verdict(False, False, False, [], sim)
+    out = buf.getvalue()
+    check("不再出現寫死的「降低周轉」建議", "降低周轉（提高 max_holding_days" not in out)
+    check("不再出現寫死的「事件日不開新倉」建議", "事件日不開新倉" not in out)
+    check("改為列出單一變數對照", "單一變數對照" in out, out[-500:])
+    check("低周轉輸給原版時如實顯示為負", "降低周轉" in out and "-" in
+          [l for l in out.splitlines() if "降低周轉" in l][0])
+    check(f"未滿 {ev.VARIANT_MIN_DAYS} 天時標明僅供參考", "僅供參考" in out)
+    check("提醒現金比例會造成假象", "現金多" in out)
+    check("顯示實際天數而不是寫死「兩週」", "兩週" not in out)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ev.final_verdict(False, None, None, None, None)
+    check("沒有模擬狀態時不會炸，也不列對照", "單一變數對照" not in buf.getvalue())
+
+
 def test_stock_py_wiring():
     print("\n[11] stock.py 接線")
     src = (ROOT / "stock.py").read_text(encoding="utf-8")
@@ -437,6 +472,7 @@ def main():
     test_same_day_stops()
     test_tool_discovery()
     test_gate4_not_run_vs_no_issues()
+    test_advice_comes_from_data()
     test_stock_py_wiring()
     print("\n" + "=" * 64)
     print(f"  通過 {_passed} 項 / 失敗 {_failed} 項")

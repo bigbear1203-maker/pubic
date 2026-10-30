@@ -46,6 +46,11 @@ ROOT = Path(__file__).resolve().parent.parent
 GATE1_MIN_LOWER_BOUND = 50.0      # Wilson 下界要超過丟銅板
 GATE3_COST_SAFETY = 1.5           # 毛利要有 1.5 倍成本的安全邊際
 MIN_TRADES_FOR_CONCLUSION = 30    # 低於此數，任何結論都只是雜訊
+VARIANT_MIN_DAYS = 60             # 單一變數對照至少要累積這麼多交易日才算數（約 3 個月）
+
+# 只改 score_topn 一個變數的對照組：(策略, 改了什麼)
+VARIANTS = (("score_lowturn", "降低周轉"), ("score_limit", "限價進場"),
+            ("reversal_topn", "反向：買跌最多的"))
 CONFIDENCE_Z = 1.96               # 95% 信賴區間
 
 
@@ -581,7 +586,43 @@ def _gap_slippage(trades: pd.DataFrame, df: pd.DataFrame):
 # 總結
 # ----------------------------------------------------------------------
 
-def final_verdict(g1, g2, g3, issues: list[str] | None):
+def variant_report(sim) -> None:
+    """
+    單一變數對照：每個變體跟 score_topn 在「兩者都有資料的期間」比報酬。
+
+    這裡只報告，不下建議。早期版本在這裡寫死了「降低周轉」「事件日不開新倉」
+    等建議，結果使用者自己的資料後來推翻了它們，工具卻每跑一次就再建議一次。
+    建議必須來自資料，不能先寫死。
+    """
+    if sim is None or "score_topn" not in sim.portfolios:
+        return
+    base = {e["date"]: e["equity"] for e in sim.portfolios["score_topn"].equity_curve}
+    rows = []
+    for name, what in VARIANTS:
+        p = sim.portfolios.get(name)
+        if p is None or not p.equity_curve:
+            continue
+        mine = {e["date"]: e for e in p.equity_curve}
+        common = sorted(d for d in mine if d in base)
+        if len(common) < 2:
+            continue
+        a, b = common[0], common[-1]
+        r_v = (mine[b]["equity"] / mine[a]["equity"] - 1) * 100
+        r_b = (base[b] / base[a] - 1) * 100
+        inv = np.mean([1 - mine[d]["cash"] / mine[d]["equity"] for d in common
+                       if mine[d]["equity"]]) * 100
+        rows.append((what, name, len(common), r_v, r_b, inv))
+    if not rows:
+        return
+    print("\n  ▸ 單一變數對照（跟 score_topn 同樣選股，只改一件事）：")
+    for what, name, n, r_v, r_b, inv in rows:
+        tag = "" if n >= VARIANT_MIN_DAYS else f"，未滿 {VARIANT_MIN_DAYS} 天僅供參考"
+        print(f"      {what:10s} {r_v - r_b:+6.2f} pp（{n} 個交易日，平均持股 {inv:.0f}%{tag}）")
+    print("    持股比例低於九成的，報酬差距有一部分只是因為現金多，不是改良有效。")
+    print(f"    要採用任何一項改變，至少要累積 {VARIANT_MIN_DAYS} 個交易日且穩定領先。")
+
+
+def final_verdict(g1, g2, g3, issues: list[str] | None, sim=None):
     _hr("結論")
     print(f"  Gate 1  模型有沒有 edge        {verdict(g1)}")
     print(f"  Gate 2  有沒有贏過不做         {verdict(g2)}")
@@ -597,16 +638,18 @@ def final_verdict(g1, g2, g3, issues: list[str] | None):
     print("\n  建議")
     print("  " + "-" * 66)
     if g1 is False:
-        print("  ▸ 不要調模型參數、不要加特徵。兩週的資料調參數是對雜訊過擬合，")
+        days = _sim_days(sim) if sim is not None else 0
+        span = f"只有 {days} 個交易日的資料" if days else "這麼少的資料"
+        print(f"  ▸ 不要調模型參數、不要加特徵。用{span}調參數是對雜訊過擬合，")
         print("    會讓回測變漂亮、實盤變差。")
-        print("  ▸ 改做不需要 edge 也有效的三件事：")
-        print("      1. 降低周轉（提高 max_holding_days、拉高進場門檻）——直接減成本")
-        print("      2. 部位大小依證據強度調整（Wilson 下界低的少押或不押）")
-        print("      3. 事件日不開新倉（python stock.py events --stats 有樣本後再啟用）")
+        print("  ▸ 事件日要不要避開，看 python stock.py events --stats 的實際結果，")
+        print("    不要直接假設事件日波動比較大。")
     elif g1 is None:
         print("  ▸ 紀錄檔缺少信賴下限欄位，先確認紀錄檔版本與完整性。")
     else:
         print("  ▸ 模型有 edge。接下來看 Gate 2/3 決定是執行面還是成本面的問題。")
+
+    variant_report(sim)
 
     if issues:
         print("\n  ▸ Gate 4 的問題優先修——那是漏水，不需要 edge 就能補：")
@@ -713,7 +756,7 @@ def main(argv=None) -> int:
         if not df.empty:
             issues = gate4_execution_logonly(df)
 
-    final_verdict(g1, g2, g3, issues)
+    final_verdict(g1, g2, g3, issues, sim if state_path else None)
     return 0
 
 
