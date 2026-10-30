@@ -163,6 +163,10 @@ BUY_HOLD_STRATEGIES = ("etf_hold",)
 # 文獻上「持續上漲」的超額報酬是中期（數個月）持有得到的，每天換股會讓
 # 0.471% 的來回成本把它吃光——實測每日換股的策略年化成本已達 55.7%。
 MONTHLY_STRATEGIES = ("trend_persistent",)
+# 一次最多補跑幾個交易日。防止狀態檔或紀錄檔出問題時一路補跑好幾個月。
+MAX_CATCHUP_DAYS = 40
+# 買進持有型的現金超過權益的這個比例，就把現金補進去
+BUY_HOLD_TOPUP_THRESHOLD = 0.05
 
 # --- 變體參數（實測依據見 docs/操作總覽.md）-----------------------------
 # 實測：15 個交易日、41~45 次買進、年化交易成本 55.7%。周轉是最大的
@@ -292,7 +296,11 @@ class Portfolio:
         for sym, pos in self.positions.items():
             px = prices.get(sym, {}).get(field)
             if px is None:
-                px = pos["avg_cost"]  # 取不到價就用成本價估，並在報告中標示
+                # 取不到價時用「最近一次看到的收盤價」，不是成本價。
+                # 用成本價估值會讓持股在抓不到價的那天瞬間跳回買進價——
+                # 實測 0050 在 9/25（中秋）、9/30、10/9 三天都被打回 113.35，
+                # 權益曲線出現假的點，任何以那幾天為端點的報酬都失真。
+                px = pos.get("last_px", pos["avg_cost"])
             total += pos["shares"] * px
         return total
 
@@ -322,6 +330,7 @@ class Portfolio:
                 "shares": shares, "avg_cost": price,
                 "entry_date": str(date), "stop_price": stop_price,
             }
+        self.positions[symbol]["last_px"] = price
         self.trades.append({
             "date": str(date), "symbol": symbol, "side": "買進", "shares": shares,
             "price": price, "amount": amount, "cost": cost, "reason": reason,
@@ -750,6 +759,18 @@ class Simulator:
         prices = fetch_prices(need, date, offline_prices) if need else {}
         print(f"      成功取得 {len(prices)} 檔")
 
+        # 需要價格卻一檔都拿不到 → 當天沒開盤（國定假日、颱風假），或價格來源
+        # 整個中斷。兩種情況都不該撮合、不該記錄權益：
+        #   · 撮合不了（沒有開盤價），委託單留到下一個交易日
+        #   · 記錄權益只會寫進一個假的點——實測 9/25 中秋、10/9 國慶補假
+        #     都被記成交易日，持股被打回成本價
+        # 不寫入 processed_dates，所以之後補跑也不會跳過真正的交易日。
+        # 用「有沒有價格」判斷而不是查假日表，是因為颱風假不在任何表上。
+        if need and not prices:
+            print("\n      ⚠ 一檔價格都取不到：判定為休市日（或價格來源中斷）。")
+            print("        今天不撮合、不記錄權益，委託單保留到下一個交易日。")
+            return
+
         fee_d = self.cfg["fee_discount"]
 
         print(f"\n[2/4] 以開盤價撮合昨日產生的委託單")
@@ -789,6 +810,16 @@ class Simulator:
             p.pending = []
 
         print(f"\n[3/4] 收盤檢查停損 / 標記市值")
+        stale = 0
+        for p in self.portfolios.values():
+            for sym, pos in p.positions.items():
+                c = prices.get(sym, {}).get("close")
+                if c is not None:
+                    pos["last_px"] = c
+                else:
+                    stale += 1
+        if stale:
+            print(f"      ⚠ 有 {stale} 筆持股取不到今日收盤價，以最近一次收盤價估值")
         for name, p in self.portfolios.items():
             stopped = self._check_stops(p, prices, date, fee_d)
             eq = p.equity(prices)
@@ -922,6 +953,52 @@ class Simulator:
                 stopped += 1
         return stopped
 
+    def forget_dates(self, dates: list[str]) -> tuple[list[str], list[str]]:
+        """
+        把「誤記成交易日」的日子從模擬裡移除（權益曲線的點與已處理日期）。
+
+        用途：舊版在國定假日也會推進模擬，持股被打回成本價，留下假的點。
+        只允許移除「當天沒有任何成交」的日子——有成交就代表那天真的有價格，
+        不是休市日，移除它會讓交易紀錄與權益曲線對不起來。
+
+        回傳 (已移除, 拒絕移除)。
+        """
+        traded = {t["date"] for p in self.portfolios.values() for t in p.trades}
+        removed, refused = [], []
+        for d in dates:
+            if d in traded:
+                refused.append(d)
+                continue
+            if d in self.state["processed_dates"]:
+                self.state["processed_dates"].remove(d)
+                for p in self.portfolios.values():
+                    p.equity_curve = [e for e in p.equity_curve if e["date"] != d]
+                removed.append(d)
+        return removed, refused
+
+    def missing_dates(self, log_path: Path | None, until: dt.date,
+                      limit: int = MAX_CATCHUP_DAYS) -> list[dt.date]:
+        """
+        紀錄檔裡有分析結果、但模擬還沒處理過的交易日（不含 until 當天）。
+
+        用紀錄檔的「資料基準日」當作交易日來源：分析程式只會在開盤日產生
+        資料，所以不需要另外維護假日表，颱風假也自然會被排除。
+        只補「最後一次處理之後」的日子，不回頭改寫已經處理過的歷史。
+        """
+        if log_path is None or not Path(log_path).exists():
+            return []
+        try:
+            df = pd.read_excel(log_path, sheet_name="分析紀錄",
+                               usecols=["股價日期(資料基準日)"])
+        except Exception:                                          # noqa: BLE001
+            return []
+        days = pd.to_datetime(df["股價日期(資料基準日)"], errors="coerce").dt.date
+        days = sorted({d for d in days.dropna()})
+        done = [dt.date.fromisoformat(d) for d in self.state["processed_dates"]]
+        last = max(done) if done else None
+        todo = [d for d in days if (last is None or d > last) and d < until]
+        return todo[:limit]
+
     def is_rebalance_day(self, strategy: str, today: dt.date,
                          trend: pd.DataFrame | None) -> bool:
         """
@@ -965,6 +1042,19 @@ class Simulator:
 
         if not targets:
             return orders
+
+        # 買進持有型：已經持有但現金還很多 → 把現金補進去。
+        # 舊版有 bug 讓 etf_hold 只投入 25%；而買進持有型「已持有就不再買」，
+        # 光修好 bug 它也會永遠停在 25%，比出來的大盤報酬只有實際的四分之一。
+        if strategy in BUY_HOLD_STRATEGIES:
+            held = [sym for sym, _ in targets if sym in p.positions]
+            if held:
+                equity = p.equity(prices) or self.state["initial_capital"]
+                if p.cash > equity * BUY_HOLD_TOPUP_THRESHOLD:
+                    orders.append({"symbol": held[0], "side": "buy",
+                                   "reason": f"補足大盤對照組的投入比例（現金 {p.cash / equity:.0%}）",
+                                   "budget": p.cash, "atr": None})
+                return orders
 
         # 已持有且不打算賣掉的，不重複買進
         holding_after = {s for s in p.positions if s not in exits}
@@ -1362,6 +1452,18 @@ def main(argv=None) -> int:
                         help="trend_screener 的輸出（趨勢股篩選結果_日期.xlsx）")
         _add_state(pp)
 
+    p_cu = sub.add_parser("catchup", help="補跑紀錄檔裡有、但模擬漏掉的交易日")
+    p_cu.add_argument("--log", type=Path, default=Path("stock_analysis_log_v3.7.xlsx"))
+    p_cu.add_argument("--until", required=True, help="補到這一天之前（不含當天）YYYY-MM-DD")
+    p_cu.add_argument("--trend-dir", type=Path, default=None,
+                      help="趨勢股篩選結果_日期.xlsx 所在資料夾（每一天用當天的名單）")
+    p_cu.add_argument("--offline-prices", type=Path, default=None, help="測試用")
+    _add_state(p_cu)
+
+    p_fg = sub.add_parser("forget", help="移除誤記成交易日的假日（當天必須沒有成交）")
+    p_fg.add_argument("--dates", required=True, help="以逗號分隔，例如 2026-09-25,2026-10-09")
+    _add_state(p_fg)
+
     p_rep = sub.add_parser("report", help="輸出結算報告")
     p_rep.add_argument("-o", "--output", type=Path, default=None)
     _add_state(p_rep)
@@ -1419,6 +1521,38 @@ def main(argv=None) -> int:
         sim.save(args.state)
         if args.cmd == "settle":
             print_report(sim)
+        return 0
+
+    if args.cmd == "forget":
+        dates = [d.strip() for d in args.dates.split(",") if d.strip()]
+        removed, refused = sim.forget_dates(dates)
+        if removed:
+            sim.save(args.state)
+            print(f"已移除：{'、'.join(removed)}")
+        for d in refused:
+            print(f"✗ 拒絕移除 {d}：當天有成交，不是休市日")
+        untouched = [d for d in dates if d not in removed and d not in refused]
+        if untouched:
+            print(f"（{'、'.join(untouched)} 本來就不在模擬裡）")
+        return 1 if refused else 0
+
+    if args.cmd == "catchup":
+        until = dt.date.fromisoformat(args.until)
+        log = args.log if args.log and args.log.exists() else None
+        todo = sim.missing_dates(log, until)
+        if not todo:
+            print("模擬沒有漏掉的交易日。")
+            return 0
+        offline = pd.read_csv(args.offline_prices) if args.offline_prices else None
+        print(f"\n★ 補跑 {len(todo)} 個漏掉的交易日：{todo[0]} ~ {todo[-1]}")
+        print("  用的是當天就已記錄在紀錄檔裡的分析結果，與當天的趨勢名單；")
+        print("  價格是事後抓的歷史價格。不會用到當天之後才知道的資訊。")
+        for d in todo:
+            trend = pd.DataFrame()
+            if args.trend_dir is not None:
+                trend = load_trend_file(args.trend_dir / f"趨勢股篩選結果_{d.isoformat()}.xlsx")
+            sim.step(d, log, offline, trend=trend)
+            sim.save(args.state)          # 每補一天就存一次，中途中斷也不會白跑
         return 0
 
     if args.cmd == "report":

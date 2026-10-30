@@ -520,6 +520,23 @@ def event_stats(log_path: Path, cal: TradingCalendar) -> int:
 
     total = len(df)
     df = df[df[RETURN_COL].notna()].copy()
+
+    # 跟 log_review 用同一套清理，兩邊的數字才對得起來：
+    #   1. 排除欄位錯位的列（程式版本欄出現「漲」「跌」那種）
+    #   2. 同一檔、同一個資料基準日跑了好幾次的，只算最後一次——
+    #      那是同一個預測，算三次會把樣本數灌水、信賴區間變得假性狹窄
+    dropped_bad = dropped_dup = 0
+    if "程式版本" in df.columns:
+        ver_ok = pd.to_numeric(df["程式版本"], errors="coerce").notna()
+        dropped_bad = int((~ver_ok).sum())
+        df = df[ver_ok]
+    key = [c for c in ("股票代碼", "股價日期(資料基準日)") if c in df.columns]
+    if len(key) == 2:
+        before = len(df)
+        if "執行時間" in df.columns:
+            df = df.assign(_ts=pd.to_datetime(df["執行時間"], errors="coerce")).sort_values("_ts")
+        df = df.drop_duplicates(subset=key, keep="last")
+        dropped_dup = before - len(df)
     if df.empty:
         print(f"✗ {total} 筆紀錄裡沒有任何一筆回填了實際報酬。")
         print("  先跑 python stock.py review。")
@@ -538,6 +555,10 @@ def event_stats(log_path: Path, cal: TradingCalendar) -> int:
     df["_is_event"] = df["_events"].map(bool)
 
     print(f"  已回填實際結果 {len(df)} 筆 / 全部 {total} 筆")
+    if dropped_bad:
+        print(f"  （排除欄位錯位的 {dropped_bad} 筆）")
+    if dropped_dup:
+        print(f"  （同一天重複執行的 {dropped_dup} 筆只算一次）")
     if unparsed:
         print(f"  ⚠ 有 {unparsed} 筆的預測目標日無法解析，已排除")
     print(f"  涵蓋期間 {lo} ~ {hi}")

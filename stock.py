@@ -59,13 +59,36 @@ OBSOLETE_PATTERNS = [
 REQUIRED_PACKAGES = ["yfinance", "pandas", "numpy", "requests", "openpyxl", "sklearn"]
 
 
+def find_all(name: str) -> list[Path]:
+    """所有找得到的同名檔案，依「同目錄、tools/、上層」的順序。"""
+    return [b / name for b in (ROOT, ROOT / "tools", ROOT.parent, ROOT.parent / "tools")
+            if (b / name).exists()]
+
+
+def copies_differ(paths: list[Path]) -> bool:
+    try:
+        return len({p.read_bytes() for p in paths}) > 1
+    except OSError:
+        return False
+
+
 def find(name: str) -> Path | None:
-    """在同目錄、tools/、上層依序找檔案。"""
-    for base in (ROOT, ROOT / "tools", ROOT.parent, ROOT.parent / "tools"):
-        p = base / name
-        if p.exists():
-            return p
-    return None
+    """
+    在同目錄、tools/、上層找檔案。
+
+    同名檔案有好幾份且內容不同時，用最近修改的那一份並警告。實測發生過：
+    新版放 tools\，主資料夾留著舊版，每次都先找到舊版——每日模擬因此
+    靜靜失敗了三週，而測試跑的是 tools\ 那份，所以全部通過。
+    """
+    found = find_all(name)
+    if not found:
+        return None
+    if len(found) > 1 and copies_differ(found):
+        chosen = max(found, key=lambda p: p.stat().st_mtime)
+        print(f"  ⚠ {name} 有 {len(found)} 份且內容不同，使用最近修改的 {chosen}")
+        print("    其餘請移到 舊版\\ 或刪除（python stock.py check 會列出全部）")
+        return chosen
+    return found[0]
 
 
 # 資料夾裡除了正在用的紀錄檔，還會有備份、修復前檔、CSV 備援、舊版留下的
@@ -121,9 +144,14 @@ def cmd_check() -> int:
                   + ("scikit-learn" if pkg == "sklearn" else pkg))
 
     print("\n[3/5] 程式檔案")
+    dups = []
     for group, names in CURRENT.items():
         for n in names:
-            p = find(n)
+            copies = find_all(n)
+            if len(copies) > 1 and copies_differ(copies):
+                dups.append((n, copies))
+            p = copies[0] if copies and not (len(copies) > 1 and copies_differ(copies)) \
+                else (max(copies, key=lambda c: c.stat().st_mtime) if copies else None)
             if p:
                 try:
                     where = p.relative_to(ROOT)
@@ -133,6 +161,20 @@ def cmd_check() -> int:
             else:
                 ok = False
                 print(f"    ✗ {group:<8} {n}　← 缺少")
+
+    if dups:
+        ok = False
+        print("\n    ✗ 同一支程式有好幾份、內容不同（新版放進 tools\\，舊版還留在主資料夾）：")
+        for n, copies in dups:
+            newest = max(copies, key=lambda c: c.stat().st_mtime)
+            for c in copies:
+                mt = dt.datetime.fromtimestamp(c.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                tag = "← 會被使用（最新）" if c == newest else "← 請移到 舊版\\ 或刪除"
+                try:
+                    where = c.relative_to(ROOT)
+                except ValueError:
+                    where = c
+                print(f"        {str(where):<34} {mt}  {tag}")
 
     print("\n[4/5] 舊版程式（建議用 archive 移走，避免混版）")
     stale = []

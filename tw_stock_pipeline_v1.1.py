@@ -57,19 +57,43 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# 同一支程式在主資料夾和 tools\ 各有一份、內容又不同時，記在這裡，
+# 啟動時與結束時都會印出來。
+DUPLICATE_WARNINGS: list[str] = []
+
+
 def _find(filename: str) -> Path:
     """
     在幾個常見位置尋找檔案，讓「全部放同一個資料夾」和「工具放 tools/ 子目錄」
     兩種擺法都能直接執行，不用改路徑。找不到時回傳同目錄的路徑，
     由呼叫端印出明確的錯誤訊息。
+
+    主資料夾與 tools\ 各有一份、內容又不同時，用「最近修改的那一份」，
+    並記下警告。實測發生過：新版放進 tools\，主資料夾留著舊版，流程一直
+    先找到舊版——舊版不認得新參數，模擬從 10/12 起每天失敗、整整三週沒有
+    推進，而測試（先找 tools\）卻全部通過，因為測試跑的是另一份。
     """
-    for candidate in (SCRIPT_DIR / filename,
-                      SCRIPT_DIR / "tools" / filename,
-                      SCRIPT_DIR.parent / filename,
-                      SCRIPT_DIR.parent / "tools" / filename):
-        if candidate.exists():
-            return candidate
-    return SCRIPT_DIR / filename
+    found = [c for c in (SCRIPT_DIR / filename,
+                         SCRIPT_DIR / "tools" / filename,
+                         SCRIPT_DIR.parent / filename,
+                         SCRIPT_DIR.parent / "tools" / filename) if c.exists()]
+    if not found:
+        return SCRIPT_DIR / filename
+    if len(found) > 1:
+        try:
+            differ = len({c.read_bytes() for c in found}) > 1
+        except OSError:
+            differ = False
+        if differ:
+            chosen = max(found, key=lambda c: c.stat().st_mtime)
+            others = [c for c in found if c != chosen]
+            DUPLICATE_WARNINGS.append(
+                f"{filename} 有 {len(found)} 份且內容不同，使用最近修改的 "
+                f"{chosen.relative_to(SCRIPT_DIR.parent)}；請把 "
+                + "、".join(str(o.relative_to(SCRIPT_DIR.parent)) for o in others)
+                + " 移到 舊版\\ 或刪除")
+            return chosen
+    return found[0]
 
 
 # 活躍股篩選程式：優先用最新版。v3.1 修正了 v2.1/v3.0 共同的「永遠不抓
@@ -133,8 +157,19 @@ def next_trading_day_hint(d: datetime.date) -> datetime.date:
     return nxt
 
 
+# 每個步驟的結果，流程結束時統一列出。單獨一行「⚠ 回傳非零結束碼」夾在
+# 幾百行輸出中間很容易漏看——實測模擬就是這樣靜靜失敗了三週。
+STEP_RESULTS: list[tuple[str, bool]] = []
+
+
 def _run_tool(script: Path, args: list[str], label: str) -> bool:
-    """以子程序執行工具，失敗不中斷整條流程。"""
+    """以子程序執行工具，失敗不中斷整條流程，但結果會記下來在最後列出。"""
+    ok = _run_tool_inner(script, args, label)
+    STEP_RESULTS.append((label, ok))
+    return ok
+
+
+def _run_tool_inner(script: Path, args: list[str], label: str) -> bool:
     if not script.exists():
         print(f"  ⚠ 找不到 {script}，略過{label}")
         return False
@@ -219,6 +254,13 @@ def main():
         print(f"    {SCRIPT_DIR}")
         print(f"    {SCRIPT_DIR / 'tools'}")
         sys.exit(1)
+
+    if DUPLICATE_WARNINGS:
+        print("\n" + "!" * 64)
+        print("  ⚠ 同一支程式有好幾份、內容不同（舊版沒清掉）：")
+        for w in DUPLICATE_WARNINGS:
+            print(f"    · {w}")
+        print("!" * 64)
 
     print("\n[檢查] 四支程式都已找到：")
     for label, p in required.items():
@@ -307,9 +349,18 @@ def main():
     print(f"{'='*64}")
 
     if not SIM_STATE.exists():
-        print("  尚未建立模擬，先執行 init（初始資金 100 萬 × 6 個獨立策略帳戶）")
+        print("  尚未建立模擬，先執行 init（初始資金 100 萬，每個策略一個獨立帳戶）")
         _run_tool(PAPER_TRADING, ["init", "--state", str(SIM_STATE),
                                   "--capital", "1000000"], "模擬初始化")
+
+    # 先補跑漏掉的交易日。之前任何一天模擬失敗（或那天沒執行），漏掉的
+    # 日子都會在這裡補上：用紀錄檔裡「當天」的分析結果與「當天」的趨勢
+    # 名單，價格抓歷史價格，不用到當天之後才知道的資訊。
+    if SIM_STATE.exists() and not is_settle:
+        _run_tool(PAPER_TRADING, ["catchup", "--state", str(SIM_STATE),
+                                  "--log", str(log_path),
+                                  "--until", today.isoformat(),
+                                  "--trend-dir", str(SCRIPT_DIR)], "補跑漏掉的交易日")
 
     sim_cmd = "settle" if is_settle else "step"
     sim_args = [sim_cmd, "--state", str(SIM_STATE),
@@ -339,6 +390,18 @@ def main():
     print(f"\n{'='*64}")
     print("整合流程執行完畢")
     print(f"{'='*64}")
+    failed = [label for label, ok in STEP_RESULTS if not ok]
+    print("  各步驟結果：")
+    for label, ok in STEP_RESULTS:
+        print(f"    {'✓' if ok else '✗'} {label}")
+    if failed:
+        print("\n" + "!" * 64)
+        print(f"  ⚠ 有 {len(failed)} 個步驟失敗：{'、'.join(failed)}")
+        print("    往上捲找「⚠」開頭的訊息看原因。紙上交易模擬失敗的話，")
+        print("    今天的資料不會進模擬；下次執行時會自動補跑。")
+        print("!" * 64)
+    for w in DUPLICATE_WARNINGS:
+        print(f"  ⚠ {w}")
     print(f"  活躍股篩選結果：{screen_output.name}")
     print(f"  個股分析紀錄：  {log_path.name}")
     print(f"  模擬狀態：      {SIM_STATE.name}")
